@@ -42,3 +42,55 @@ jobs:
 
       - name: The pin and the streams on the loopback
         run: python3 .github/scripts/client_pin_test.py meson-build-release
+
+  android:
+    name: Android (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86, x86_64]
+    env:
+      # the NDK Niko builds its core with
+      NDK_VERSION: 28.2.13676358
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Install the NDK and ninja
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" > /dev/null
+          echo "NDK=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: OpenSSL for the ABI
+        run: .github/scripts/android-openssl.sh "$NDK" "${{ matrix.abi }}" "$RUNNER_TEMP/openssl"
+
+      - name: Build the client
+        run: |
+          cmake -S android -B build-android -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${{ matrix.abi }}" -DANDROID_PLATFORM=android-23 -DANDROID_STL=c++_static \
+            -DOPENSSL_ROOT_DIR="$RUNNER_TEMP/openssl"
+          cmake --build build-android --target slipstream-client
+
+      - name: Only the system's libraries, 16 KB pages
+        run: |
+          readelf="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          file build-android/slipstream-client
+          "$readelf" -d build-android/slipstream-client | tee dynamic.txt
+          needed=$(grep NEEDED dynamic.txt | grep -oE '\[[^]]+\]' | tr -d '[]' | sort | tr '\n' ' ')
+          echo "needed: $needed"
+          for lib in $needed; do
+            case "$lib" in libc.so|libm.so|libdl.so|liblog.so) ;; *) echo "not a system library: $lib"; exit 1 ;; esac
+          done
+          "$readelf" -lW build-android/slipstream-client | awk '$1 == "LOAD" { print; if ($NF != "0x4000") bad = 1 } END { exit bad }'
+          mkdir -p out
+          cp build-android/slipstream-client out/libslipstream.so
+          sha256sum out/libslipstream.so
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: slipstream-client-android-${{ matrix.abi }}
+          path: out/libslipstream.so
