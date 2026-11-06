@@ -20,7 +20,9 @@ tar -xzf "$work/openssl.tar.gz" -C "$work"
 cd "$work/openssl-$version"
 export ANDROID_NDK_ROOT=$ndk
 export PATH=$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
-./Configure "$target" -D__ANDROID_API__=$api no-shared no-tests no-engine --prefix="$prefix" --libdir=lib
+./Configure "$target" -D__ANDROID_API__=$api no-shared no-tests no-engine no-zlib --prefix="$prefix" --libdir=lib
 make -j"$(nproc)" build_libs > /dev/null
 make install_dev > /dev/null
+# the libraries and headers only: no CMake or pkg-config metadata for the build to read its link line from
+rm -rf "$prefix/lib/cmake" "$prefix/lib/pkgconfig"
 ls -l "$prefix/lib"

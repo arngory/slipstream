@@ -7,8 +7,9 @@ project(slipstream_android C CXX)
 
 set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
-# OpenSSL static, found under its own prefix (the toolchain looks in the NDK's sysroot only)
-set(OPENSSL_USE_STATIC_LIBS TRUE)
+# OpenSSL static, given by its files under its own prefix (the toolchain looks in the NDK's sysroot only). Not
+# OPENSSL_USE_STATIC_LIBS: FindOpenSSL then adds the optional libraries OpenSSL can be built with (jitterentropy, zstd)
+# whether this build has them or not; the NDK's driver links libdl, which is all libcrypto needs besides libc.
 set(OPENSSL_INCLUDE_DIR ${OPENSSL_ROOT_DIR}/include CACHE PATH "" FORCE)
 set(OPENSSL_CRYPTO_LIBRARY ${OPENSSL_ROOT_DIR}/lib/libcrypto.a CACHE FILEPATH "" FORCE)
 set(OPENSSL_SSL_LIBRARY ${OPENSSL_ROOT_DIR}/lib/libssl.a CACHE FILEPATH "" FORCE)
