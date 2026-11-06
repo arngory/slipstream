@@ -21,6 +21,7 @@
 #include "picoquic_config.h"
 #include "slipstream.h"
 #include "slipstream_inline_dots.h"
+#include "slipstream_pin.h"
 #include "slipstream_utils.h"
 #include "SPCDNS/src/dns.h"
 #include "SPCDNS/src/mappings.h"
@@ -50,6 +51,7 @@ typedef struct st_slipstream_client_ctx_t {
     bool ready;
     bool closed;
     int listen_sock;
+    slipstream_client_tls_t tls;
 } slipstream_client_ctx_t;
 
 char* client_domain_name = NULL;
@@ -646,7 +648,7 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
                                   picoquic_quic_t* quic, picoquic_cnx_t** cnx,
                                   slipstream_client_ctx_t* client_ctx) {
     int ret = 0;
-    char const* sni = SLIPSTREAM_SNI;
+    char const* sni = client_ctx->tls.sni;
     uint64_t current_time = picoquic_current_time();
 
     *cnx = NULL;
@@ -670,7 +672,7 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
 
     /* Create a client connection */
     *cnx = picoquic_create_cnx(quic, picoquic_null_connection_id, picoquic_null_connection_id,
-        (struct sockaddr*)server_address, current_time, 0, sni, SLIPSTREAM_ALPN, 1);
+        (struct sockaddr*)server_address, current_time, 0, sni, client_ctx->tls.alpn, 1);
     if (*cnx == NULL) {
         fprintf(stderr, "Could not create connection context\n");
         return -1;
@@ -698,7 +700,9 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
     return ret;
 }
 
-int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addresses, size_t server_address_count, const char* domain_name, const char* cc_algo_id, bool gso, const size_t keep_alive_interval) {
+int picoquic_slipstream_client(const char* listen_host, int listen_port, struct st_address_t* server_addresses,
+                               size_t server_address_count, const char* domain_name, const char* cc_algo_id, bool gso,
+                               const size_t keep_alive_interval, const slipstream_client_tls_t* tls) {
     /* Start: start the QUIC process */
     int ret = 0;
     uint64_t current_time = 0;
@@ -726,13 +730,15 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     config.use_long_log = 1;
     config.do_preemptive_repeat = 1;
     config.disable_port_blocking = 1;
-    config.enable_sslkeylog = 1;
-    config.alpn = SLIPSTREAM_ALPN;
+    /* no TLS key log: the keys of the tunnel never leave the process */
+    config.enable_sslkeylog = 0;
+    config.alpn = tls->alpn;
 
     /* Create the QUIC context for the server */
     current_time = picoquic_current_time();
     // one connection only, freed in slipstream_client_free_context on picoquic close callback
     slipstream_client_ctx_t client_ctx = {0};
+    client_ctx.tls = *tls;
     /* Create QUIC context */
     picoquic_quic_t* quic = picoquic_create_and_configure(&config, slipstream_client_callback, &client_ctx, current_time, NULL);
     if (quic == NULL) {
@@ -746,7 +752,12 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     picoquic_set_qlog(quic, config.qlog_dir);
     debug_printf_push_stream(stderr);
 #endif
-    picoquic_set_key_log_file_from_env(quic);
+    /* the server's certificate by its pin, or not at all when none is given (--insecure) */
+    if (tls->pin != NULL && slipstream_set_pin(quic, tls->pin) != 0) {
+        fprintf(stderr, "Invalid --pin: the base64url SHA-256 of the server's public key, 43 characters\n");
+        picoquic_free(quic);
+        return -1;
+    }
     // picoquic_set_textlog(quic, "-");
     // picoquic_set_log_level(quic, 1);
     // TODO: idle timeout?
@@ -780,7 +791,12 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
 
     struct sockaddr_in listen_addr = {0};
     listen_addr.sin_family = AF_INET;
-    listen_addr.sin_addr.s_addr = INADDR_ANY;
+    /* the loopback by default: on any other address the tunnel is anyone's on the network */
+    if (inet_pton(AF_INET, listen_host, &listen_addr.sin_addr) != 1) {
+        fprintf(stderr, "Invalid listen address %s (an IPv4 address)\n", listen_host);
+        close(client_ctx.listen_sock);
+        exit(EXIT_FAILURE);
+    }
     listen_addr.sin_port = htons(listen_port);
 
     if (bind(client_ctx.listen_sock, (struct sockaddr*)&listen_addr, sizeof(listen_addr)) < 0) {
@@ -795,7 +811,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
         exit(EXIT_FAILURE);
     }
 
-    printf("Listening on port %d...\n", listen_port);
+    printf("Listening on %s port %d...\n", listen_host, listen_port);
 
     picoquic_packet_loop_param_t param = {0};
     param.local_af = client_ctx.server_addresses[0].server_address.ss_family;

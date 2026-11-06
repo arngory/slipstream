@@ -34,8 +34,22 @@ The client is placed inside the restricted network.
 ```shell
 $ slipstream-client \
   --resolver-address=x.x.x.x:yy \ # Address of public DNS resolver or DHCP assigned resolver
-  --domain=test.com
+  --domain=test.com \
+  --pin=<base64url SHA-256 of the server's public key>
 ```
+
+The client checks the server by the pin of its public key: the base64url (no padding) SHA-256 of the certificate's
+SubjectPublicKeyInfo. No CA is trusted and the name is not checked, so the certificate can be self-signed. For the
+certificate in `cert.pem`:
+
+```shell
+$ openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der \
+    | openssl dgst -sha256 -binary | basenc --base64url | tr -d '='
+```
+
+`--insecure` takes any certificate instead (for tests: the tunnel is then open to whoever answers). `--alpn` and
+`--sni` set what the TLS ClientHello carries (defaults: `picoquic_sample`, `test.example.com`); the client listens on
+`--tcp-listen-host` (default `127.0.0.1`). The TLS keys are not logged.
 
 
 ### Configuration of DNS records
@@ -59,7 +73,8 @@ This is a similar trick to using WireGuard on port 53, additionally encoding as 
 $ slipstream-client \
   --congestion-control=bbr \ # Faster better than dcubic in direct connections
   --resolver-address=x.x.x.x:yy \ # Address of slipstream server
-  --domain=test.com
+  --domain=test.com \
+  --pin=<base64url SHA-256 of the server's public key>
 ```
 
 ## Example data transfer
@@ -79,7 +94,8 @@ $ slipstream-client \
   --congestion-control=bbr \
   --tcp-listen-port=7000 \
   --resolver=127.0.0.1:8853 \
-  --domain=test.com
+  --domain=test.com \
+  --insecure
 Adding 127.0.0.1:8853
 Starting connection to 127.0.0.1
 Initial connection ID: 54545454

@@ -116,6 +116,7 @@ endif
 client_sources = files(
   src / 'slipstream_client.c',
   src / 'slipstream_client_cli.cpp',
+  src / 'slipstream_pin.c',
 )
 
 # Sources only used by server
