@@ -66,7 +66,12 @@ jobs:
       - name: Install the NDK and ninja
         run: |
           sudo apt-get update && sudo apt-get install -y ninja-build
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" > /dev/null
+          # the SDK's download breaks off now and then ("Premature EOF"): three tries
+          for try in 1 2 3; do
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" > /dev/null && break
+            test "$try" -lt 3 && sleep 10
+          done
+          test -f "$ANDROID_HOME/ndk/${NDK_VERSION}/source.properties"
           echo "NDK=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: OpenSSL for the ABI
@@ -80,7 +85,7 @@ jobs:
             -DOPENSSL_ROOT_DIR="$RUNNER_TEMP/openssl"
           cmake --build build-android --target slipstream-client
 
-      - name: Only the system's libraries, 16 KB pages
+      - name: Only the system's libraries, 16 KB pages on 64-bit
         run: |
           readelf="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
           file build-android/slipstream-client
@@ -90,7 +95,10 @@ jobs:
           for lib in $needed; do
             case "$lib" in libc.so|libm.so|libdl.so|liblog.so) ;; *) echo "not a system library: $lib"; exit 1 ;; esac
           done
-          "$readelf" -lW build-android/slipstream-client | awk '$1 == "LOAD" { print; if ($NF != "0x4000") bad = 1 } END { exit bad }'
+          # 16 KB pages are a 64-bit thing (Android 15+); the 32-bit ABIs keep 4 KB
+          case "${{ matrix.abi }}" in arm64-v8a|x86_64) align=0x4000 ;; *) align=0x1000 ;; esac
+          "$readelf" -lW build-android/slipstream-client \
+            | awk -v align="$align" '$1 == "LOAD" { print; if ($NF != align) bad = 1 } END { exit bad }'
           mkdir -p out
           cp build-android/slipstream-client out/libslipstream.so
           sha256sum out/libslipstream.so
