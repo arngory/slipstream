@@ -11,6 +11,7 @@
 #include <picoquic_internal.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <inttypes.h>
 #include <slipstream_sockloop.h>
 #include <stdbool.h>
 #include <arpa/nameser.h>
@@ -63,6 +64,8 @@ typedef struct st_slipstream_client_ctx_t {
     slipstream_client_tls_t tls;
     /* the stream list: the accepter thread adds, the network thread walks and removes */
     pthread_mutex_t streams_lock;
+    /* why the connection ended before it was ready, for the exit code (SLIPSTREAM_CLIENT_EXIT_*) */
+    int exit_code;
 } slipstream_client_ctx_t;
 
 char* client_domain_name = NULL;
@@ -609,6 +612,21 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
     case picoquic_callback_close: /* Received connection close */
     case picoquic_callback_application_close: /* Received application close */
         printf("Connection closed.\n");
+        if (!client_ctx->ready && client_ctx->exit_code == 0) {
+            /* the handshake never ended: say why, so whoever runs the client can tell a wrong key from a server
+             * that does not answer */
+            uint64_t local_error = picoquic_get_local_error(cnx);
+            uint64_t remote_error = picoquic_get_remote_error(cnx);
+            if (local_error == PICOQUIC_TRANSPORT_CRYPTO_ERROR(PTLS_ALERT_BAD_CERTIFICATE) ||
+                local_error == PICOQUIC_TRANSPORT_CRYPTO_ERROR(PTLS_ALERT_CERTIFICATE_REQUIRED)) {
+                fprintf(stderr, "Handshake failed: the server's key is not the pinned one\n");
+                client_ctx->exit_code = SLIPSTREAM_CLIENT_EXIT_PIN;
+            } else {
+                fprintf(stderr, "Handshake failed: local error 0x%" PRIx64 ", remote error 0x%" PRIx64 "\n",
+                        local_error, remote_error);
+                client_ctx->exit_code = SLIPSTREAM_CLIENT_EXIT_HANDSHAKE;
+            }
+        }
         should_shutdown = true;
         break;
     case picoquic_callback_prepare_to_send:
@@ -946,5 +964,8 @@ int picoquic_slipstream_client(const char* listen_host, int listen_port, struct 
 
     picoquic_free(quic);
 
+    if (client_ctx.exit_code != 0) {
+        return client_ctx.exit_code;
+    }
     return ret;
 }

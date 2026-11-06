@@ -51,6 +51,9 @@ $ openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der \
 `--sni` set what the TLS ClientHello carries (defaults: `picoquic_sample`, `test.example.com`); the client listens on
 `--tcp-listen-host` (default `127.0.0.1`). The TLS keys are not logged.
 
+The client exits with 1 on bad arguments, 2 when the handshake fails (the server does not answer, or refuses), and
+3 when the server's key is not the pinned one.
+
 
 ### Configuration of DNS records
 

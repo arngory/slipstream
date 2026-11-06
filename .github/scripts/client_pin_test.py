@@ -151,6 +151,15 @@ try:
                              ("other key", 7003, b"")):
         check(name, ask(port, time.monotonic() + (60 if want else 20)), want)
 
+    # the other key: the client says so and ends with its own exit code
+    other = dict(procs)["other key"]
+    try:
+        other.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        failures.append("other key: the client still runs")
+    if other.returncode != 3:
+        failures.append("other key: exit %s, want 3 (the server's key is not the pinned one)" % other.returncode)
+
     # the streams through the pinned client, now connected
     for i in range(20):
         request = b"hello %d\n" % i
