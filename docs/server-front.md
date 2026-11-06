@@ -48,22 +48,37 @@ socket is created with mode 0660; who reaches it is the directory's business, an
   Anything else gets no answer. SPCDNS asserts on malformed input, and upstream such a datagram ended the process.
 - The name must end in `--domain`. A name outside it gets REFUSED, another type an empty NOERROR, and bad base32
   SERVFAIL.
-- The answer has an OPT record only when the query had one, and then with the query's DO bit.
+- The answer has an OPT record only when the query had one, and then with the query's DO bit and a size of 4096, the
+  size every answer of a raycontrol node says (the front's own, dnstt's). Names of up to 253 characters are taken.
 - Errors of one datagram (decoding, QUIC, encoding, sending) drop that datagram, never the server.
 - Version negotiation and stateless reset packets are dropped as they come. Upstream they queued without a bound,
   addressed to the dummy peer.
 - Key log: never written. `SSLKEYLOGFILE` is ignored.
-- Streams: the client's bidirectional ones only (`--max-streams`); a unidirectional one gets STOP_SENDING, and the
-  transport parameters allow one (picoquic reads 0 as no limit).
+- Copies of a packet: a query is bound to a connection, and gets its next packet, only when picoquic took the
+  query's packet as new. A copy (anyone on the path can resend a query, from any address) or a packet that does not
+  open names the connection all the same; it is answered empty. picoquic forgot the packet numbers it had
+  received once the peer acknowledged its ACK, and took a copy of an older packet as new: every ACK context keeps an
+  ACK horizon of 10 s (everything below it counts as received).
+- Streams: the client's bidirectional ones only (`--max-streams`). The client opens no other: a unidirectional
+  stream closes the connection (refused one by one, their records stayed until it ended). The transport
+  parameters allow one (picoquic reads 0 as no limit).
 - The UDP socket does not block: a lone query is answered at once, and SIGTERM ends the loop.
-- A path that went away since its query (multipath) is looked up again by its unique ID before the answer.
-- Bytes for a target go to its socket at once when nothing waits before them; one connection queues a quarter of
-  `--max-pending-mib` at most.
+- Paths (multipath): a path that went away since its query is looked up again by its unique ID before the answer,
+  and one abandoned since is not used. A connection with every path abandoned goes (prepare would take a path
+  without a connection ID, or none, and crash); a connection with none left is reaped.
+- Bytes for a target go to its socket at once when nothing waits before them. One connection queues
+  `--max-pending-mib` over `--max-connections` at most, 1 MiB at least.
+- Descriptors: a target socket per stream, and a connection may have about 1.5 times `--max-streams` at once
+  (picoquic opens the next ones before the closed ones go). The soft limit goes up to the hard one; below
+  `--max-connections` × `--max-streams` × 1.5 + 64 the server warns (raise LimitNOFILE). Out of descriptors,
+  accepting a front pauses 100 ms; the rest goes on.
 
 ## Checks
 
 `test/server/run.sh build` runs:
 - an echo through the tunnel over UDP;
+- an echo with a copy of every query sent from another address once answered (`replay.py`): every copy must be
+  answered empty;
 - an echo through a stand-in front, with and without an 8-byte tag;
 - hostile and mutated queries, after which the server must still be up;
 - a stranger on the front socket, who must be refused;

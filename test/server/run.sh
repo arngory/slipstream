@@ -49,6 +49,17 @@ echo_through 25400 || fail "echo over UDP"
 [ ! -e keys.log ] || fail "SSLKEYLOGFILE was written"
 echo "ok: UDP echo, hostile and mutated queries, no key log"
 
+# copies of the client's queries from another address get nothing of the
+# connection (slipstream-v1 §1 item 5)
+python3 "$here/replay.py" 25301 25300 "$work/replay.status" & pids+=($!)
+"$build/slipstream-client" -l 25401 -r 127.0.0.1:25301 -d t.example >client-replay.log 2>&1 & pids+=($!)
+sleep 2
+echo_through 25401 || fail "echo with copies of the queries"
+read -r _ copies _ with_data < "$work/replay.status" || fail "no copies answered"
+[ "$copies" -gt 50 ] || fail "only $copies copies answered"
+[ "$with_data" = 0 ] || fail "$with_data of $copies copies got the connection's data"
+echo "ok: $copies copies of queries answered empty, echo intact"
+
 # a DNS front, without and with a device tag
 for tag in 0 8; do
   sock="$work/front$tag.sock"

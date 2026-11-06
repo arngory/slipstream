@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <assert.h>
 #include <picoquic_internal.h>
 #include <slipstream_sockloop.h>
@@ -109,7 +110,9 @@ ssize_t server_encode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
     edns.opt.type = RR_OPT;
     edns.opt.class = CLASS_UNKNOWN;
     edns.opt.ttl = 0;
-    edns.opt.udp_payload = 1232;
+    /* The size every answer of the node says (the front's own answers and
+     * dnstt's): the server's answers do not stand out (review). */
+    edns.opt.udp_payload = 4096;
     edns.opt.fdo = query_opt != NULL && query_opt->fdo;
 
     dns_query_t response = {0};
@@ -204,8 +207,11 @@ static size_t server_canonical_query(const uint8_t* in, size_t len, uint8_t* out
         if (label > 63 || i + label > len) {
             return 0; /* a compression pointer, or past the end */
         }
+        /* Each label with its length byte: a name of 253 characters
+         * (the most, RFC 1035 §2.3.4: 255 bytes with the root) counts 254
+         * (review: 253 dropped the longest names the front passes on). */
         name_len += (size_t)label + 1;
-        if (name_len > 253) {
+        if (name_len > 254) {
             return 0;
         }
         for (size_t j = 0; j < label; j++) {
@@ -355,6 +361,7 @@ ssize_t server_decode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
  * slowly cannot hold more than its share of the memory. */
 static size_t slipstream_pending_total = 0;
 static size_t slipstream_pending_max = 64 * 1024 * 1024;
+static size_t slipstream_max_connections = 64;
 #define SLIPSTREAM_WRITE_BUDGET (64 * 1024)
 #define SLIPSTREAM_CONNECT_TIMEOUT_US (30ULL * 1000000)
 
@@ -610,9 +617,10 @@ static int slipstream_server_queue(slipstream_server_stream_ctx_t* stream_ctx,
             slipstream_pending_total, (unsigned long long)stream_ctx->stream_id);
         return -1;
     }
-    /* One connection takes a quarter of the budget at most: it cannot
-     * starve the others (review). */
-    const size_t share = MAX(slipstream_pending_max / 4, (size_t)SLIPSTREAM_PENDING_LIMIT);
+    /* One connection takes its share of the budget at most (the budget
+     * over --max-connections, 1 MiB at least): it cannot starve the others
+     * (review: a quarter let four take it all). */
+    const size_t share = MAX(slipstream_pending_max / MAX(slipstream_max_connections, (size_t)1), (size_t)SLIPSTREAM_PENDING_LIMIT);
     if (length > share - MIN(share, stream_ctx->owner->pending_bytes)) {
         fprintf(stderr, "A connection's write queues hold %zu bytes, its share: stream %llu dropped\n",
             stream_ctx->owner->pending_bytes, (unsigned long long)stream_ctx->stream_id);
@@ -758,7 +766,11 @@ static void slipstream_server_reap(picoquic_quic_t* quic) {
     while (cnx != NULL) {
         picoquic_cnx_t* next = picoquic_get_next_cnx(cnx);
         uint64_t deadline;
-        if (cnx->cnx_state >= picoquic_state_ready) {
+        if (cnx->nb_paths < 1 || cnx->path[0] == NULL) {
+            /* Every path abandoned and deleted: nothing reaches it, and
+             * the timer below would read path[0] (review). */
+            deadline = 0;
+        } else if (cnx->cnx_state >= picoquic_state_ready) {
             uint64_t rto = picoquic_current_retransmit_timer(cnx, cnx->path[0]);
             uint64_t interval = MAX(cnx->idle_timeout, 3 * rto);
             deadline = cnx->latest_receive_time + interval;
@@ -812,10 +824,13 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
     case picoquic_callback_stream_data:
     case picoquic_callback_stream_fin:
         if (!PICOQUIC_IS_BIDIR_STREAM_ID(stream_id)) {
-            /* The tunnel's streams are the client's bidirectional ones: no
-             * target connection for any other (review: unidirectional ones
-             * went past --max-streams). */
-            (void)picoquic_stop_sending(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
+            /* The tunnel's streams are the client's bidirectional ones, and
+             * the client opens no other: the connection goes. Refused one
+             * by one, their records stayed until it ended (picoquic frees a
+             * stream once what it sent is acked, and nothing is sent on
+             * one), and opening them without end grew memory and CPU
+             * (review). */
+            (void)picoquic_close(cnx, SLIPSTREAM_INTERNAL_ERROR);
             return 0;
         }
         if (stream_ctx == NULL) {
@@ -928,6 +943,7 @@ typedef struct st_server_io_t {
     int listen_fd;  /* front mode: the listening socket */
     int front_fd;   /* front mode: the front's connection, -1 while away */
     long front_uid;
+    uint64_t accept_after; /* out of descriptors: no accept before this time */
 } server_io_t;
 
 static int server_open_udp(const slipstream_server_config_t* config) {
@@ -993,8 +1009,9 @@ static void server_accept(server_io_t* io) {
     if (fd < 0) {
         if (errno == EMFILE || errno == ENFILE) {
             /* The connection waits in the backlog: the listening socket
-             * stays readable, and the loop would spin (review). */
-            usleep(100 * 1000);
+             * stays readable. Accepting pauses for 100 ms; the rest of
+             * the loop goes on (review: a sleep here slowed every batch). */
+            io->accept_after = picoquic_current_time() + 100 * 1000;
         }
         return;
     }
@@ -1119,10 +1136,52 @@ static void server_drop_stateless(picoquic_quic_t* quic) {
 /* server_loop answers queries until a signal: each query gets one answer
  * (the next QUIC packet of its connection, or none) or, when it does not
  * read, nothing. A bad datagram never ends it. */
+/* How long the ranges of packet numbers received stay before the ACK
+ * horizon takes them (µs): everything below the horizon counts as received.
+ * picoquic leaves the delay at 0, and then deletes a range once the peer
+ * has acknowledged the ACK that carried it: a copy of an older packet was
+ * taken as new (review: replays of a device's query got the connection's
+ * next packet). 10 s: a resolver's retries come within it. */
+#define SERVER_ACK_HORIZON_US (10 * 1000000LL)
+
+/* Gives each ACK context of cnx the horizon delay: the packet number spaces,
+ * and each path's own in multipath (paths come and go). */
+static void server_keep_horizon(picoquic_cnx_t* cnx) {
+    for (int pc = 0; pc < picoquic_nb_packet_context; pc++) {
+        if (cnx->ack_ctx[pc].sack_list.horizon_delay == 0) {
+            cnx->ack_ctx[pc].sack_list.horizon_delay = SERVER_ACK_HORIZON_US;
+        }
+    }
+    for (int k = 0; k < cnx->nb_paths; k++) {
+        if (cnx->path[k] != NULL && cnx->path[k]->ack_ctx.sack_list.horizon_delay == 0) {
+            cnx->path[k]->ack_ctx.sack_list.horizon_delay = SERVER_ACK_HORIZON_US;
+        }
+    }
+}
+
+/* A path a packet can go on: not demoted, with the peer's connection ID. */
+static bool server_path_usable(const picoquic_path_t* path) {
+    return path != NULL && !path->path_is_demoted && path->p_remote_cnxid != NULL;
+}
+
+/* Whether a connection has a path a packet can go on. */
+static bool server_has_path(const picoquic_cnx_t* cnx) {
+    if (cnx->cnx_state == picoquic_state_disconnected) {
+        return false;
+    }
+    for (int k = 0; k < cnx->nb_paths; k++) {
+        if (server_path_usable(cnx->path[k])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_ctx, server_io_t* io) {
     static server_slot_t slots[PICOQUIC_PACKET_LOOP_RECV_MAX];
     uint8_t buffer[SERVER_MAX_QUERY];
     uint8_t send_buffer[PICOQUIC_MAX_PACKET_SIZE];
+    uint64_t last_receive_time = 0; /* strictly increasing: see the receive below */
     while (!should_shutdown) {
         slipstream_server_reap(quic);
         short revents = 0;
@@ -1131,9 +1190,16 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
             return -1;
         }
         if (io->listen_fd >= 0) {
+            const uint64_t now = picoquic_current_time();
             if (io->front_fd < 0) {
                 if (revents & POLLIN) {
-                    server_accept(io);
+                    if (now < io->accept_after) {
+                        /* No front, so no queries: waiting is all there is
+                         * to do, and polling again would spin. */
+                        usleep((useconds_t)(io->accept_after - now));
+                    } else {
+                        server_accept(io);
+                    }
                 }
                 continue;
             }
@@ -1143,7 +1209,7 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
             }
             /* A front that reconnected while this one is up replaces it. */
             struct pollfd listen_poll = {.fd = io->listen_fd, .events = POLLIN};
-            if (poll(&listen_poll, 1, 0) > 0 && (listen_poll.revents & POLLIN)) {
+            if (now >= io->accept_after && poll(&listen_poll, 1, 0) > 0 && (listen_poll.revents & POLLIN)) {
                 server_accept(io);
             }
         } else if (revents & POLLNVAL) {
@@ -1185,11 +1251,26 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
             }
             picoquic_cnx_t* last_cnx = NULL;
             int last_path_id = -1;
+            /* A time no earlier call had: picoquic sets the connection's
+             * latest_receive_time to it only for a packet it took. A copy
+             * of a packet it already had, or one it cannot open, still
+             * names the connection (its DCID) with no error; bound to it,
+             * the query took the connection's next packet to the copy's
+             * address (review: replays of a device's query through the
+             * front, slipstream-v1 §1 item 5). It is answered empty. */
+            uint64_t receive_time = picoquic_current_time();
+            if (receive_time <= last_receive_time) {
+                receive_time = last_receive_time + 1;
+            }
+            last_receive_time = receive_time;
             int ret = picoquic_incoming_packet_ex(quic, decoded, (size_t)decoded_len,
                 (struct sockaddr*)&peer_addr, (struct sockaddr*)&local_addr, 0, 0,
-                &last_cnx, &last_path_id, picoquic_current_time());
+                &last_cnx, &last_path_id, receive_time);
             free(decoded);
-            if (ret != 0 || last_cnx == NULL) {
+            if (last_cnx != NULL) {
+                server_keep_horizon(last_cnx);
+            }
+            if (ret != 0 || last_cnx == NULL || last_cnx->latest_receive_time != receive_time) {
                 continue; /* answered empty */
             }
             slot->s.cnx = last_cnx;
@@ -1203,7 +1284,12 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
         }
         server_drop_stateless(quic);
 
-        const uint64_t loop_time = picoquic_current_time();
+        /* Never before a receive time given out above (picoquic takes
+         * the difference for the ACK delay). */
+        uint64_t loop_time = picoquic_current_time();
+        if (loop_time < last_receive_time) {
+            loop_time = last_receive_time;
+        }
         for (size_t i = 0; i < nb_slots; i++) {
             server_slot_t* slot = &slots[i];
             if (!slot->answer) {
@@ -1213,6 +1299,16 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
             struct sockaddr_storage peer_addr = {0};
             struct sockaddr_storage local_addr = {0};
             int if_index = 0;
+            if (slot->s.error == RCODE_OKAY && slot->s.cnx != NULL && !server_has_path(slot->s.cnx)) {
+                /* Every path abandoned (the client's PATH_ABANDON, or a
+                 * picoquic demotion): prepare would take one without a
+                 * connection ID, or none at all once they are deleted, and
+                 * crash (review: a client with two resolvers took the
+                 * server down). The connection goes; the query is answered
+                 * empty. */
+                picoquic_connection_disconnect(slot->s.cnx);
+                slot->s.cnx = NULL;
+            }
             if (slot->s.error == RCODE_OKAY && slot->s.cnx != NULL && slot->s.path_id >= 0) {
                 /* prepare deletes abandoned paths first, which moves the
                  * indexes, then takes the one it was given: a path gone
@@ -1225,6 +1321,13 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
                     picoquic_delete_abandoned_paths(cnx, loop_time, &next_wake);
                 }
                 slot->s.path_id = picoquic_find_path_by_unique_id(cnx, slot->unique_path_id);
+                if (slot->s.path_id >= 0 && !server_path_usable(cnx->path[slot->s.path_id])) {
+                    slot->s.path_id = -1; /* abandoned since: prepare picks one */
+                }
+                if (!server_has_path(cnx)) {
+                    picoquic_connection_disconnect(cnx);
+                    slot->s.cnx = NULL;
+                }
             }
             if (slot->s.error == RCODE_OKAY && slot->s.cnx != NULL &&
                 picoquic_prepare_packet_ex(slot->s.cnx, slot->s.path_id, loop_time,
@@ -1260,6 +1363,27 @@ int picoquic_slipstream_server(const slipstream_server_config_t* cfg) {
     server_domain_name_len = strlen(cfg->domain);
     server_tag_len = cfg->tag_len;
     slipstream_pending_max = cfg->max_pending;
+    slipstream_max_connections = cfg->max_connections;
+
+    /* A target socket per stream: a connection may have about 1.5 times
+     * --max-streams at once (picoquic opens the next ones before the
+     * closed ones go). The soft limit goes up to the hard one, and a
+     * limit below what the options allow is said (review: 1024 left
+     * every stream past ~11 busy connections reset). */
+    struct rlimit nofile;
+    if (getrlimit(RLIMIT_NOFILE, &nofile) == 0) {
+        if (nofile.rlim_cur < nofile.rlim_max) {
+            nofile.rlim_cur = nofile.rlim_max;
+            (void)setrlimit(RLIMIT_NOFILE, &nofile);
+            (void)getrlimit(RLIMIT_NOFILE, &nofile);
+        }
+        const unsigned long long need = (unsigned long long)cfg->max_connections * cfg->max_streams * 3 / 2 + 64;
+        if (nofile.rlim_cur != RLIM_INFINITY && (unsigned long long)nofile.rlim_cur < need) {
+            fprintf(stderr, "Warning: %llu file descriptors, and --max-connections with --max-streams allow %llu target sockets: "
+                "streams past the limit are reset (raise LimitNOFILE or lower the options)\n",
+                (unsigned long long)nofile.rlim_cur, need);
+        }
+    }
 
     int mtu = 900;
 
