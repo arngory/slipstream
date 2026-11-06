@@ -28,6 +28,7 @@
 #include "slipstream_utils.h"
 #include "SPCDNS/src/dns.h"
 #include <openssl/rand.h>
+#include <picotls.h>
 #include "SPCDNS/src/mappings.h"
 
 volatile sig_atomic_t should_shutdown = 0;
