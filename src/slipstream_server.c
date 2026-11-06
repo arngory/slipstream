@@ -62,6 +62,7 @@ static size_t server_tag_len = 0;
 typedef struct st_server_slot_t {
     slot_t s; /* first: server_decode and server_encode take it as slot_t */
     bool answer; /* an answer goes back for this query */
+    uint64_t unique_path_id; /* the path the query came on: indexes move when paths go */
     uint8_t front_addrs[FRONT_ADDRS_LEN];
 } server_slot_t;
 
@@ -87,6 +88,13 @@ ssize_t server_encode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
 
     slot_t* slot = (slot_t*) slot_p;
 
+    /* SPCDNS asserts when an answer fills its buffer exactly (1492): the
+     * header, the question (a name up to 255), the TXT record with its
+     * length bytes and the OPT fit below it with a packet up to 1100
+     * (QUIC packets are 900 at most here). */
+    if (src_buf_len > 1100) {
+        return -1;
+    }
     dns_query_t *query = (dns_query_t *) slot->dns_decoded;
     /* server_decode answers only one IN question of a QUERY: what SPCDNS
      * can encode without tripping its asserts. */
@@ -380,6 +388,7 @@ typedef struct st_slipstream_server_ctx_t {
     picoquic_cnx_t* cnx;
     slipstream_server_stream_ctx_t* first_stream;
     struct sockaddr_storage upstream_addr;
+    size_t pending_bytes; /* queued towards the target, all this connection's streams */
     struct st_slipstream_server_ctx_t* prev_ctx;
     struct st_slipstream_server_ctx_t* next_ctx;
     /* Only the default context owns the reusable poll arrays. */
@@ -416,6 +425,7 @@ static void slipstream_server_free_stream_context(slipstream_server_ctx_t* serve
         free(pending);
     }
     slipstream_pending_total -= stream_ctx->pending_bytes;
+    server_ctx->pending_bytes -= stream_ctx->pending_bytes;
     free(stream_ctx);
 }
 
@@ -532,6 +542,7 @@ static int slipstream_server_flush(slipstream_server_stream_ctx_t* stream_ctx) {
         pending->offset += (size_t)n;
         stream_ctx->pending_bytes -= (size_t)n;
         slipstream_pending_total -= (size_t)n;
+        stream_ctx->owner->pending_bytes -= (size_t)n;
         budget -= (size_t)n;
         if (pending->offset == pending->length) {
             stream_ctx->pending_first = pending->next;
@@ -564,6 +575,31 @@ static int slipstream_server_queue(slipstream_server_stream_ctx_t* stream_ctx,
     if (length == 0) {
         return 0;
     }
+    /* Nothing queued before: to the target at once, only the rest waits.
+     * A queue is for a target that reads slower than the tunnel, not for
+     * every byte (review: a full budget reset streams that could write). */
+    if (stream_ctx->pending_first == NULL && !stream_ctx->connecting && !stream_ctx->write_shutdown) {
+        int flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+        flags |= MSG_NOSIGNAL;
+#endif
+        ssize_t n;
+        do {
+            n = send(stream_ctx->fd, bytes, length, flags);
+        } while (n < 0 && errno == EINTR);
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            slipstream_server_log_error(stream_ctx, "send() failed");
+            return -1;
+        }
+        if (n > 0) {
+            stream_ctx->tcp_sent += (uint64_t)n;
+            bytes += n;
+            length -= (size_t)n;
+            if (length == 0) {
+                return 0;
+            }
+        }
+    }
     if (length > SLIPSTREAM_PENDING_LIMIT - stream_ctx->pending_bytes) {
         fprintf(stderr, "Upstream write queue exceeded %d bytes on stream %llu\n",
             SLIPSTREAM_PENDING_LIMIT, (unsigned long long)stream_ctx->stream_id);
@@ -572,6 +608,14 @@ static int slipstream_server_queue(slipstream_server_stream_ctx_t* stream_ctx,
     if (length > slipstream_pending_max - slipstream_pending_total) {
         fprintf(stderr, "Upstream write queues hold %zu bytes, the limit: stream %llu dropped\n",
             slipstream_pending_total, (unsigned long long)stream_ctx->stream_id);
+        return -1;
+    }
+    /* One connection takes a quarter of the budget at most: it cannot
+     * starve the others (review). */
+    const size_t share = MAX(slipstream_pending_max / 4, (size_t)SLIPSTREAM_PENDING_LIMIT);
+    if (length > share - MIN(share, stream_ctx->owner->pending_bytes)) {
+        fprintf(stderr, "A connection's write queues hold %zu bytes, its share: stream %llu dropped\n",
+            stream_ctx->owner->pending_bytes, (unsigned long long)stream_ctx->stream_id);
         return -1;
     }
     slipstream_pending_t* pending = malloc(sizeof(*pending) + length);
@@ -590,6 +634,7 @@ static int slipstream_server_queue(slipstream_server_stream_ctx_t* stream_ctx,
     stream_ctx->pending_last = pending;
     stream_ctx->pending_bytes += length;
     slipstream_pending_total += length;
+    stream_ctx->owner->pending_bytes += length;
     return 0;
 }
 
@@ -766,6 +811,13 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
     switch (fin_or_event) {
     case picoquic_callback_stream_data:
     case picoquic_callback_stream_fin:
+        if (!PICOQUIC_IS_BIDIR_STREAM_ID(stream_id)) {
+            /* The tunnel's streams are the client's bidirectional ones: no
+             * target connection for any other (review: unidirectional ones
+             * went past --max-streams). */
+            (void)picoquic_stop_sending(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
+            return 0;
+        }
         if (stream_ctx == NULL) {
             /* reset/stop_sending clear app_stream_ctx in this PicoQUIC revision.
              * Late peer data must not resurrect an aborted TCP connection. */
@@ -893,7 +945,9 @@ static int server_open_udp(const slipstream_server_config_t* config) {
         ((struct sockaddr_in6*)&addr)->sin6_port = htons((uint16_t)config->listen_port);
         addr_len = sizeof(struct sockaddr_in6);
     }
-    int fd = socket(addr.ss_family, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+    /* Non-blocking: a lone query is answered at once, not when nine more
+     * come, and a signal ends the loop (review). */
+    int fd = socket(addr.ss_family, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, IPPROTO_UDP);
     if (fd < 0) {
         perror("Unable to create DNS listen socket");
         return -1;
@@ -937,6 +991,11 @@ static int server_open_front(const char* path) {
 static void server_accept(server_io_t* io) {
     int fd = accept4(io->listen_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
     if (fd < 0) {
+        if (errno == EMFILE || errno == ENFILE) {
+            /* The connection waits in the backlog: the listening socket
+             * stays readable, and the loop would spin (review). */
+            usleep(100 * 1000);
+        }
         return;
     }
     struct ucred cred;
@@ -1093,7 +1152,11 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
         }
 
         size_t nb_slots = 0;
-        while (nb_slots < PICOQUIC_PACKET_LOOP_RECV_MAX) {
+        /* Datagrams that get no answer count too: a flood of them must not
+         * keep the batch from its answers (review). */
+        size_t nb_reads = 0;
+        while (nb_slots < PICOQUIC_PACKET_LOOP_RECV_MAX && nb_reads < 8 * PICOQUIC_PACKET_LOOP_RECV_MAX && !should_shutdown) {
+            nb_reads++;
             server_slot_t* slot = &slots[nb_slots];
             memset(slot, 0, sizeof(*slot));
             slot->s.path_id = -1;
@@ -1131,6 +1194,11 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
             }
             slot->s.cnx = last_cnx;
             slot->s.path_id = last_path_id;
+            if (last_path_id >= 0 && last_path_id < last_cnx->nb_paths && last_cnx->path[last_path_id] != NULL) {
+                slot->unique_path_id = last_cnx->path[last_path_id]->unique_path_id;
+            } else {
+                slot->s.path_id = -1;
+            }
             last_cnx->no_ack_delay = 1;
         }
         server_drop_stateless(quic);
@@ -1145,6 +1213,19 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
             struct sockaddr_storage peer_addr = {0};
             struct sockaddr_storage local_addr = {0};
             int if_index = 0;
+            if (slot->s.error == RCODE_OKAY && slot->s.cnx != NULL && slot->s.path_id >= 0) {
+                /* prepare deletes abandoned paths first, which moves the
+                 * indexes, then takes the one it was given: a path gone
+                 * since the query (or by an earlier slot's prepare) was a
+                 * NULL dereference (review). The same deletion here, then
+                 * the path by its unique ID, or none. */
+                picoquic_cnx_t* cnx = slot->s.cnx;
+                if (cnx->path_demotion_needed) {
+                    uint64_t next_wake = UINT64_MAX;
+                    picoquic_delete_abandoned_paths(cnx, loop_time, &next_wake);
+                }
+                slot->s.path_id = picoquic_find_path_by_unique_id(cnx, slot->unique_path_id);
+            }
             if (slot->s.error == RCODE_OKAY && slot->s.cnx != NULL &&
                 picoquic_prepare_packet_ex(slot->s.cnx, slot->s.path_id, loop_time,
                     send_buffer, sizeof(send_buffer), &send_length,
@@ -1218,6 +1299,9 @@ int picoquic_slipstream_server(const slipstream_server_config_t* cfg) {
     }
 
     picoquic_set_cookie_mode(quic, 0);
+    /* A connection that never finishes its handshake held its place for the
+     * idle timeout (review): 10 s, as the reaper reads it too. */
+    picoquic_set_default_handshake_timeout(quic, 10 * 1000000ULL);
     picoquic_set_default_priority(quic, 2);
 #ifdef BUILD_LOGLIB
     picoquic_set_qlog(quic, config.qlog_dir);
@@ -1226,7 +1310,10 @@ int picoquic_slipstream_server(const slipstream_server_config_t* cfg) {
     picoquic_set_default_congestion_algorithm(quic, slipstream_server_cc_algorithm);
     picoquic_tp_t tp = *picoquic_get_default_tp(quic);
     tp.initial_max_stream_id_bidir = cfg->max_streams;
-    tp.initial_max_stream_id_unidir = 0;
+    /* 0 means no limit to picoquic: one frame on a far stream ID made it
+     * allocate every stream below it (review). The client opens none; the
+     * callback refuses one anyway. */
+    tp.initial_max_stream_id_unidir = 1;
     picoquic_set_default_tp(quic, &tp);
 
     server_io_t io = {.udp_fd = -1, .listen_fd = -1, .front_fd = -1, .front_uid = cfg->front_uid};
@@ -1238,8 +1325,12 @@ int picoquic_slipstream_server(const slipstream_server_config_t* cfg) {
     if (io.udp_fd < 0 && io.listen_fd < 0) {
         ret = -1;
     } else {
-        signal(SIGTERM, server_sighandler);
-        signal(SIGINT, server_sighandler);
+        /* Without SA_RESTART: a blocked call returns on a signal. */
+        struct sigaction sa = {0};
+        sa.sa_handler = server_sighandler;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
         signal(SIGPIPE, SIG_IGN);
         ret = server_loop(quic, &default_context, &io);
     }

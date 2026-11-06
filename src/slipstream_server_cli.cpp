@@ -16,7 +16,7 @@ struct ServerArgs : MainArguments<ServerArgs> {
     std::string listen_address = option("dns-listen-address", 'b', "DNS listen IPv4/IPv6 literal (default: wildcard; overrides --dns-listen-ipv6)");
     bool listen_ipv6 = option("dns-listen-ipv6", '6', "DNS listen on IPv6 (default: false)") = false;
     std::string front_socket = option("front-socket", 'f', "Take queries from a DNS front on this unix SOCK_SEQPACKET socket instead of UDP");
-    long front_uid = option("front-uid", 'u', "The DNS front's UID: other peers of --front-socket are refused (default: any)") = -1;
+    long front_uid = option("front-uid", 'u', "The DNS front's UID: other peers of --front-socket are refused (required with it)") = -1;
     std::string target_address = option("target-address", 'a', "Target server address (default: 127.0.0.1:5201)") = "127.0.0.1:5201";
     std::string target_unix = option("target-unix", 'x', "Target unix stream socket (instead of --target-address)");
     std::string cert = option("cert", 'c', "Certificate file path (required)");
@@ -120,6 +120,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         dns_listen_address_ptr = &dns_listen_address;
+    }
+    /* Whoever reaches the socket would be the front, and the front checks
+     * the device tags the server only skips (review). */
+    if (!args.front_socket.empty() && args.front_uid < 0) {
+        std::cerr << "Server error: --front-socket needs --front-uid, the front's UID" << std::endl;
+        return 1;
     }
     if (!args.front_socket.empty() && args.front_socket.size() >= sizeof(((struct sockaddr_un*)0)->sun_path)) {
         std::cerr << "Server error: --front-socket path is too long" << std::endl;

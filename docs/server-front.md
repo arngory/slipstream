@@ -12,11 +12,11 @@ of a UDP socket, and is hardened for queries from anyone.
 | Option | Meaning |
 |---|---|
 | `--front-socket PATH` | take queries from a DNS front on this unix `SOCK_SEQPACKET` socket, not UDP |
-| `--front-uid UID` | the front's UID: any other peer of the socket is refused (default: any) |
+| `--front-uid UID` | required with `--front-socket`: the front's UID; any other peer of the socket is refused |
 | `--target-unix PATH` | the target is a unix stream socket, not `--target-address` |
 | `--alpn ALPN` | required: the ALPN clients must offer (no shared default: it is in every Initial packet) |
 | `--cert`, `--key` | required: no default to the public test key |
-| `--idle-timeout S` | seconds a connection may stay silent before it goes (default 120; upstream: never) |
+| `--idle-timeout S` | seconds a connection may stay silent before it goes (default 120; upstream: never); a handshake has 10 s |
 | `--max-connections N` | connections at once (default 64; upstream: 8) |
 | `--max-streams N` | streams at once per connection (default 64) |
 | `--max-pending-mib N` | bytes queued towards the target, all streams together (default 64 MiB) |
@@ -53,6 +53,12 @@ socket is created with mode 0660; who reaches it is the directory's business, an
 - Version negotiation and stateless reset packets are dropped as they come. Upstream they queued without a bound,
   addressed to the dummy peer.
 - Key log: never written. `SSLKEYLOGFILE` is ignored.
+- Streams: the client's bidirectional ones only (`--max-streams`); a unidirectional one gets STOP_SENDING, and the
+  transport parameters allow one (picoquic reads 0 as no limit).
+- The UDP socket does not block: a lone query is answered at once, and SIGTERM ends the loop.
+- A path that went away since its query (multipath) is looked up again by its unique ID before the answer.
+- Bytes for a target go to its socket at once when nothing waits before them; one connection queues a quarter of
+  `--max-pending-mib` at most.
 
 ## Checks
 
