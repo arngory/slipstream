@@ -7,6 +7,10 @@ on:
   push:
     branches:
       - "server/**"
+    # server-vX.Y.Z publishes the two servers and their SHA256SUMS
+    # (raycontrol pins them by SHA-256, deploy/versions.env there).
+    tags:
+      - "server-v*"
   workflow_dispatch:
 
 permissions:
@@ -51,3 +55,35 @@ jobs:
         with:
           name: slipstream-server-linux-${{ matrix.arch }}
           path: slipstream-server-linux-${{ matrix.arch }}*
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/server-v')
+    needs: server
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: slipstream-server-linux-*
+          merge-multiple: true
+          path: dist
+
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum slipstream-server-linux-amd64 slipstream-server-linux-arm64 | tee SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: The release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes=(--notes "slipstream-server from ${GITHUB_SHA} (docs/server-front.md)")
+          if [ -f "docs/server-releases/${TAG}.md" ]; then notes=(--notes-file "docs/server-releases/${TAG}.md"); fi
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "slipstream-server ${TAG#server-}" "${notes[@]}" \
+            dist/slipstream-server-linux-amd64 dist/slipstream-server-linux-arm64 dist/SHA256SUMS
