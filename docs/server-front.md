@@ -62,13 +62,16 @@ socket is created with mode 0660; who reaches it is the directory's business, an
   generations of 2^18 slots, 4 MiB; a full one turns early), and a copy goes no further. Beyond that, every 1-RTT
   ACK context keeps an ACK horizon (10 s, raised to the lowest range kept): what lies below it counts as received.
   A packet older than the horizon that was never received is dropped; QUIC sends its frames again. In front mode
-  the front refuses copies for as long as their tag holds.
+  the front refuses copies for as long as their tag holds. Left open: a peer that gets ~2^17 packets taken twice
+  within 10 s (~26 000 a second) turns the memory early, and copies of the numbers picoquic cut off may pass in
+  UDP mode; a copy that reaches the server before the original takes its answer.
 - Streams: the client's bidirectional ones only (`--max-streams`). The client opens no other: a unidirectional
   stream closes the connection (refused one by one, their records stayed until it ended). The transport
   parameters allow one (picoquic reads 0 as no limit).
 - The UDP socket does not block: a lone query is answered at once, and SIGTERM ends the loop.
 - Paths (multipath): a path that went away since its query is looked up again by its unique ID before the answer;
-  one abandoned since, or still without the peer's connection ID, is not used: the first path that has one is named. A connection with every path abandoned goes (prepare would take a path
+  one abandoned since, about to be (a failed challenge), or still without the peer's connection ID, is not used: the
+  first path that is fit is named. Abandoned paths are deleted before any slot's answer. A connection with every path abandoned goes (prepare would take a path
   without a connection ID, or none, and crash); a connection with none left is reaped.
 - Bytes for a target go to its socket at once when nothing waits before them. One connection queues
   `--max-pending-mib` over `--max-connections` at most, 4 MiB (four streams' limit) at least.

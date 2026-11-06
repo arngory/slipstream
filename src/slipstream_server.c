@@ -1249,9 +1249,11 @@ static void seen_take(uint64_t h, uint64_t now) {
     seen_packets.count++;
 }
 
-/* A path a packet can go on: not demoted, with the peer's connection ID. */
+/* A path a packet can go on: not demoted nor about to be (a failed
+ * challenge: prepare demotes it and clears its connection ID before using
+ * it, review), with the peer's connection ID. */
 static bool server_path_usable(const picoquic_path_t* path) {
-    return path != NULL && !path->path_is_demoted && path->p_remote_cnxid != NULL;
+    return path != NULL && !path->path_is_demoted && !path->challenge_failed && path->p_remote_cnxid != NULL;
 }
 
 /* Whether a connection has a path a packet can go on. */
@@ -1415,18 +1417,20 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
                 picoquic_connection_disconnect(slot->s.cnx);
                 slot->s.cnx = NULL;
             }
-            if (slot->s.error == RCODE_OKAY && slot->s.cnx != NULL && slot->s.path_id >= 0) {
+            if (slot->s.error == RCODE_OKAY && slot->s.cnx != NULL) {
                 /* prepare deletes abandoned paths first, which moves the
                  * indexes, then takes the one it was given: a path gone
                  * since the query (or by an earlier slot's prepare) was a
-                 * NULL dereference (review). The same deletion here, then
-                 * the path by its unique ID, or none. */
+                 * NULL dereference (review). The same deletion here, for
+                 * any slot, then the path by its unique ID, or none. */
                 picoquic_cnx_t* cnx = slot->s.cnx;
                 if (cnx->path_demotion_needed) {
                     uint64_t next_wake = UINT64_MAX;
                     picoquic_delete_abandoned_paths(cnx, loop_time, &next_wake);
                 }
-                slot->s.path_id = picoquic_find_path_by_unique_id(cnx, slot->unique_path_id);
+                if (slot->s.path_id >= 0) {
+                    slot->s.path_id = picoquic_find_path_by_unique_id(cnx, slot->unique_path_id);
+                }
                 if (!server_has_path(cnx)) {
                     picoquic_connection_disconnect(cnx);
                     slot->s.cnx = NULL;
