@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* accept4, struct ucred */
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <picoquic.h>
@@ -16,6 +19,9 @@
 #include <arpa/nameser.h>
 #include <sys/param.h>
 #include <sys/poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
 #include <assert.h>
 #include <picoquic_internal.h>
 #include <slipstream_sockloop.h>
@@ -40,33 +46,63 @@ void server_sighandler(int signum) {
 
 char* server_domain_name = NULL;
 size_t server_domain_name_len = 0;
+/* Bytes at the start of a query's data that the DNS front checked (the
+ * dnsauth-v2 field): not part of the QUIC packet. */
+static size_t server_tag_len = 0;
+
+/* IPC with a DNS front (niko-server "packet" mode, docs/server-front.md):
+ * one SOCK_SEQPACKET message per query and per answer,
+ *   "NU" | 1 | client (19) | local (19) | DNS message
+ * The addresses go back as they came: the front answers that query. */
+#define FRONT_ADDRS_LEN (2 * 19)
+#define FRONT_HEADER_LEN (3 + FRONT_ADDRS_LEN)
+/* The front forwards queries up to this size; SPCDNS decodes into 4 KiB. */
+#define SERVER_MAX_QUERY 4096
+
+typedef struct st_server_slot_t {
+    slot_t s; /* first: server_decode and server_encode take it as slot_t */
+    bool answer; /* an answer goes back for this query */
+    uint8_t front_addrs[FRONT_ADDRS_LEN];
+} server_slot_t;
+
+/* The answer mirrors the query's EDNS: an OPT only when the query had one,
+ * with its DO bit (RFC 6891 §7, RFC 3225). */
+static const dns_edns0opt_t* server_query_opt(const dns_query_t* query) {
+    for (size_t i = 0; i < query->arcount; i++) {
+        if (query->additional[i].generic.type == RR_OPT) {
+            return &query->additional[i].opt;
+        }
+    }
+    return NULL;
+}
 
 ssize_t server_encode(void* slot_p, void* callback_ctx, unsigned char** dest_buf, const unsigned char* src_buf, size_t src_buf_len, size_t* segment_len, struct sockaddr_storage* peer_addr, struct sockaddr_storage* local_addr) {
+    (void)callback_ctx;
     *dest_buf = NULL;
 
     // we don't support segmentation in the server
-    assert(segment_len == NULL || *segment_len == 0 || *segment_len == src_buf_len);
+    if (segment_len != NULL && *segment_len != 0 && *segment_len != src_buf_len) {
+        return -1;
+    }
 
     slot_t* slot = (slot_t*) slot_p;
 
-#ifdef NOENCODE
-    *dest_buf = malloc(src_buf_len);
-    memcpy((void*)*dest_buf, src_buf, src_buf_len);
-
-    memcpy(peer_addr, &slot->peer_addr, sizeof(struct sockaddr_storage));
-    memcpy(local_addr, &slot->local_addr, sizeof(struct sockaddr_storage));
-
-    return src_buf_len;
-#endif
-
     dns_query_t *query = (dns_query_t *) slot->dns_decoded;
-    dns_txt_t answer_txt; // TODO: fix
+    /* server_decode answers only one IN question of a QUERY: what SPCDNS
+     * can encode without tripping its asserts. */
+    if (query->qdcount != 1 || query->questions == NULL || query->questions[0].class != CLASS_IN ||
+        query->questions[0].type == RR_OPT) {
+        return -1;
+    }
+    dns_txt_t answer_txt;
     dns_answer_t edns = {0};
+    const dns_edns0opt_t* query_opt = server_query_opt(query);
     edns.opt.name = ".";
     edns.opt.type = RR_OPT;
     edns.opt.class = CLASS_UNKNOWN;
     edns.opt.ttl = 0;
     edns.opt.udp_payload = 1232;
+    edns.opt.fdo = query_opt != NULL && query_opt->fdo;
 
     dns_query_t response = {0};
     response.id = query->id;
@@ -80,10 +116,10 @@ ssize_t server_encode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
     response.questions = query->questions;
 
     if (src_buf_len > 0) {
-        const dns_question_t *question = &query->questions[0]; // assuming server_decode ensures there is exactly one question
+        const dns_question_t *question = &query->questions[0];
         answer_txt.name = question->name;
-        answer_txt.type = question->type;
-        answer_txt.class = question->class;
+        answer_txt.type = RR_TXT;
+        answer_txt.class = CLASS_IN;
         answer_txt.ttl = 60;
         answer_txt.text = (char *)src_buf;
         answer_txt.len = src_buf_len;
@@ -94,16 +130,21 @@ ssize_t server_encode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
     /* An empty successful poll is NOERROR/NODATA, not a nonexistent name.
      * Preserve actual decode errors already stored in slot->error. */
 
-    response.arcount = 1;
-    response.additional = &edns;
+    if (query_opt != NULL) {
+        response.arcount = 1;
+        response.additional = &edns;
+    }
 
     dns_packet_t* packet = malloc(MAX_UDP_PACKET_SIZE);
+    if (packet == NULL) {
+        return -1;
+    }
     size_t packet_len = MAX_UDP_PACKET_SIZE;
     dns_rcode_t rc = dns_encode(packet, &packet_len, &response);
     if (rc != RCODE_OKAY) {
         free(packet);
         DBG_PRINTF("dns_encode() = (%d) %s", rc, dns_rcode_text(rc));
-        return EXIT_FAILURE;
+        return -1;
     }
     *dest_buf = (unsigned char*)packet;
 
@@ -113,7 +154,110 @@ ssize_t server_encode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
     return packet_len;
 }
 
+/* name ends with "." domain "." in any case, after at least one label. */
+static bool server_name_in_domain(const char* name, size_t name_len) {
+    if (name_len < server_domain_name_len + 3) {
+        return false;
+    }
+    const char* suffix = name + name_len - server_domain_name_len - 1;
+    return suffix[-1] == '.' && suffix[server_domain_name_len] == '.' &&
+        strncasecmp(suffix, server_domain_name, server_domain_name_len) == 0;
+}
+
+/* server_canonical_query checks a query by hand and rebuilds it for
+ * SPCDNS, whose decoder asserts (and so ends the process) on malformed
+ * input: a header with QR 0 and opcode QUERY, exactly one question of
+ * class IN whose name is uncompressed labels of letters, digits, '-' and
+ * '_', at most one OPT record (its options dropped: only the size and DO
+ * matter), nothing else and nothing after. It writes the rebuilt query to
+ * out (len bytes at most) and returns its length, or 0 for anything else. */
+static size_t server_canonical_query(const uint8_t* in, size_t len, uint8_t* out) {
+    if (len < 12 || len > SERVER_MAX_QUERY) {
+        return 0;
+    }
+    const uint16_t flags = (uint16_t)(in[2] << 8 | in[3]);
+    const uint16_t qd = (uint16_t)(in[4] << 8 | in[5]);
+    const uint16_t an = (uint16_t)(in[6] << 8 | in[7]);
+    const uint16_t ns = (uint16_t)(in[8] << 8 | in[9]);
+    const uint16_t ar = (uint16_t)(in[10] << 8 | in[11]);
+    if ((flags & 0x8000) != 0 || ((flags >> 11) & 0xf) != 0 || qd != 1 || an != 0 || ns != 0 || ar > 1) {
+        return 0;
+    }
+    size_t i = 12;
+    size_t name_len = 0;
+    for (;;) {
+        if (i >= len) {
+            return 0;
+        }
+        const uint8_t label = in[i++];
+        if (label == 0) {
+            break;
+        }
+        if (label > 63 || i + label > len) {
+            return 0; /* a compression pointer, or past the end */
+        }
+        name_len += (size_t)label + 1;
+        if (name_len > 253) {
+            return 0;
+        }
+        for (size_t j = 0; j < label; j++) {
+            const uint8_t c = in[i + j];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+                return 0;
+            }
+        }
+        i += label;
+    }
+    if (name_len == 0 || i + 4 > len) {
+        return 0;
+    }
+    const uint16_t qtype = (uint16_t)(in[i] << 8 | in[i + 1]);
+    const uint16_t qclass = (uint16_t)(in[i + 2] << 8 | in[i + 3]);
+    if (qclass != CLASS_IN || qtype == RR_OPT || qtype == 0) {
+        return 0;
+    }
+    i += 4;
+    const size_t question_end = i;
+    uint16_t opt_size = 0;
+    uint8_t opt_flags = 0;
+    if (ar == 1) {
+        /* root name, type OPT, class = size, ttl = rcode|version|flags, rdlength */
+        if (i + 11 > len || in[i] != 0 || (in[i + 1] << 8 | in[i + 2]) != RR_OPT) {
+            return 0;
+        }
+        opt_size = (uint16_t)(in[i + 3] << 8 | in[i + 4]);
+        if (in[i + 6] != 0) {
+            return 0; /* EDNS version 0 only */
+        }
+        opt_flags = in[i + 7] & 0x80; /* DO */
+        const size_t rdlen = (size_t)(in[i + 9] << 8 | in[i + 10]);
+        i += 11 + rdlen;
+        if (i > len) {
+            return 0;
+        }
+    }
+    if (i != len) {
+        return 0;
+    }
+    memcpy(out, in, question_end);
+    out[2] &= 0x01; /* RD only: no AA, TC */
+    out[3] &= 0x10; /* CD only: Z, AD and RCODE cleared */
+    out[10] = 0;
+    out[11] = ar;
+    size_t n = question_end;
+    if (ar == 1) {
+        const uint8_t opt[11] = {0, 0, RR_OPT, (uint8_t)(opt_size >> 8), (uint8_t)opt_size, 0, 0, opt_flags, 0, 0, 0};
+        memcpy(out + n, opt, sizeof(opt));
+        n += sizeof(opt);
+    }
+    return n;
+}
+
+/* server_decode returns the QUIC packet's length, 0 for a query answered
+ * without one (slot->error says how), or -1 for a datagram that gets no
+ * answer at all. It never ends the server. */
 ssize_t server_decode(void* slot_p, void* callback_ctx, unsigned char** dest_buf, const unsigned char* src_buf, size_t src_buf_len, struct sockaddr_storage *peer_addr, struct sockaddr_storage *local_addr) {
+    (void)callback_ctx;
     *dest_buf = NULL;
 
     slot_t* slot = slot_p;
@@ -126,73 +270,83 @@ ssize_t server_decode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
     // Save local address for right response local addr
     memcpy(&slot->local_addr, local_addr, sizeof(struct sockaddr_storage));
 
-#ifdef NODECODE
-    *dest_buf = malloc(src_buf_len);
-    memcpy((void*)*dest_buf, src_buf, src_buf_len);
-
-    return src_buf_len;
-#endif
-
+    /* SPCDNS reads only what this rebuilt: it ends the process on input
+     * it does not expect. */
+    uint8_t canonical[SERVER_MAX_QUERY];
+    const size_t canonical_len = server_canonical_query(src_buf, src_buf_len, canonical);
+    if (canonical_len == 0) {
+        return -1;
+    }
     size_t packet_len = DNS_DECODEBUF_4K * sizeof(dns_decoded_t);
     dns_decoded_t* packet = slot->dns_decoded;
-    const dns_rcode_t rc = dns_decode(packet, &packet_len, (const dns_packet_t*) src_buf, src_buf_len);
+    const dns_rcode_t rc = dns_decode(packet, &packet_len, (const dns_packet_t*) canonical, canonical_len);
     if (rc != RCODE_OKAY) {
         DBG_PRINTF("dns_decode() = (%d) %s", rc, dns_rcode_text(rc));
-        // TODO: how to get rid of this packet
-        return -1; // TODO: server failure
+        return -1;
     }
 
     const dns_query_t *query = (dns_query_t*) packet;
-    if (!query->query) {
-        DBG_PRINTF("dns record is not a query", NULL);
-        slot->error = RCODE_FORMAT_ERROR;
-        return 0;
-    }
-
-    if (query->qdcount != 1) {
-        DBG_PRINTF("dns record should contain exactly one query", NULL);
-        slot->error = RCODE_FORMAT_ERROR;
-        return 0;
+    /* Only what the answer can echo: one question of class IN in a query.
+     * Anything else is not a tunnel query and gets nothing. */
+    if (!query->query || query->opcode != OP_QUERY || query->qdcount != 1 || query->questions == NULL ||
+        query->questions[0].class != CLASS_IN || query->questions[0].type == RR_OPT ||
+        query->questions[0].name == NULL) {
+        DBG_PRINTF("not a single IN query", NULL);
+        return -1;
     }
 
     const dns_question_t *question = &query->questions[0];
+    const size_t name_len = strlen(question->name);
+    if (!server_name_in_domain(question->name, name_len)) {
+        slot->error = RCODE_REFUSED;
+        return 0;
+    }
     if (question->type != RR_TXT) {
-        // resolvers send anything for pinging, so we only respond to TXT queries
-        // DBG_PRINTF("query type is not TXT", NULL);
-        slot->error = RCODE_NAME_ERROR;
+        // resolvers send anything for pinging: an empty answer, as the zone would give
+        slot->error = RCODE_OKAY;
         return 0;
     }
 
-    const ssize_t data_len = strlen(question->name) - server_domain_name_len - 1 - 1;
-    if (data_len <= 0) {
-        DBG_PRINTF("subdomain is empty", NULL);
-        slot->error = RCODE_NAME_ERROR;
-        return 0;
-    }
+    const size_t data_len = name_len - server_domain_name_len - 2;
 
     // copy the subdomain from name to a new buffer
     char data_buf[data_len + 1];
     memcpy(data_buf, question->name, data_len);
     data_buf[data_len] = '\0';
     const size_t encoded_len = slipstream_inline_undotify(data_buf, data_len);
+    if (encoded_len == 0) {
+        slot->error = RCODE_OKAY;
+        return 0;
+    }
 
     char* decoded_buf = malloc(encoded_len);
+    if (decoded_buf == NULL) {
+        return -1;
+    }
     const size_t decoded_len = b32_decode(decoded_buf, data_buf, encoded_len, false);
-    if (decoded_len == (size_t) -1) {
+    if (decoded_len == (size_t) -1 || decoded_len <= server_tag_len) {
         free(decoded_buf);
         DBG_PRINTF("error decoding base32: %lu", decoded_len);
         slot->error = RCODE_SERVER_FAILURE;
         return 0;
     }
+    /* The front checked the device's tag; QUIC gets what follows it. */
+    if (server_tag_len > 0) {
+        memmove(decoded_buf, decoded_buf + server_tag_len, decoded_len - server_tag_len);
+    }
 
-    *dest_buf = decoded_buf;
+    *dest_buf = (unsigned char*)decoded_buf;
 
-    return decoded_len;
+    return (ssize_t)(decoded_len - server_tag_len);
 }
 
 /* All stream state and descriptors belong exclusively to the network thread.
  * No detached workers retain stream, connection, or network-loop pointers. */
 #define SLIPSTREAM_PENDING_LIMIT (1024 * 1024)
+/* All streams together (--max-pending-mib): a stream whose target reads
+ * slowly cannot hold more than its share of the memory. */
+static size_t slipstream_pending_total = 0;
+static size_t slipstream_pending_max = 64 * 1024 * 1024;
 #define SLIPSTREAM_WRITE_BUDGET (64 * 1024)
 #define SLIPSTREAM_CONNECT_TIMEOUT_US (30ULL * 1000000)
 
@@ -261,6 +415,7 @@ static void slipstream_server_free_stream_context(slipstream_server_ctx_t* serve
         stream_ctx->pending_first = pending->next;
         free(pending);
     }
+    slipstream_pending_total -= stream_ctx->pending_bytes;
     free(stream_ctx);
 }
 
@@ -294,6 +449,8 @@ static slipstream_server_stream_ctx_t* slipstream_server_create_stream_ctx(
         addr_len = sizeof(struct sockaddr_in);
     } else if (af == AF_INET6) {
         addr_len = sizeof(struct sockaddr_in6);
+    } else if (af == AF_UNIX) {
+        addr_len = sizeof(struct sockaddr_un);
     } else {
         fprintf(stderr, "Invalid upstream address family\n");
         return NULL;
@@ -374,6 +531,7 @@ static int slipstream_server_flush(slipstream_server_stream_ctx_t* stream_ctx) {
         stream_ctx->tcp_sent += (uint64_t)n;
         pending->offset += (size_t)n;
         stream_ctx->pending_bytes -= (size_t)n;
+        slipstream_pending_total -= (size_t)n;
         budget -= (size_t)n;
         if (pending->offset == pending->length) {
             stream_ctx->pending_first = pending->next;
@@ -411,6 +569,11 @@ static int slipstream_server_queue(slipstream_server_stream_ctx_t* stream_ctx,
             SLIPSTREAM_PENDING_LIMIT, (unsigned long long)stream_ctx->stream_id);
         return -1;
     }
+    if (length > slipstream_pending_max - slipstream_pending_total) {
+        fprintf(stderr, "Upstream write queues hold %zu bytes, the limit: stream %llu dropped\n",
+            slipstream_pending_total, (unsigned long long)stream_ctx->stream_id);
+        return -1;
+    }
     slipstream_pending_t* pending = malloc(sizeof(*pending) + length);
     if (pending == NULL) {
         return -1;
@@ -426,6 +589,7 @@ static int slipstream_server_queue(slipstream_server_stream_ctx_t* stream_ctx,
     }
     stream_ctx->pending_last = pending;
     stream_ctx->pending_bytes += length;
+    slipstream_pending_total += length;
     return 0;
 }
 
@@ -433,7 +597,8 @@ static int slipstream_server_queue(slipstream_server_stream_ctx_t* stream_ctx,
  * no longer polled for reads until prepare_to_send consumes it or sees EAGAIN;
  * otherwise a readable TCP socket would spin while awaiting another DNS poll. */
 static int slipstream_server_poll(slipstream_server_ctx_t* default_ctx,
-                                  picoquic_socket_ctx_t* dns_socket) {
+                                  int dns_fd, short* dns_revents) {
+    *dns_revents = 0;
     size_t count = 1;
     for (slipstream_server_ctx_t* ctx = default_ctx->next_ctx; ctx != NULL; ctx = ctx->next_ctx) {
         for (slipstream_server_stream_ctx_t* stream = ctx->first_stream; stream != NULL; stream = stream->next_stream) {
@@ -457,7 +622,7 @@ static int slipstream_server_poll(slipstream_server_ctx_t* default_ctx,
     }
     struct pollfd* fds = default_ctx->poll_fds;
     slipstream_server_stream_ctx_t** streams = default_ctx->poll_streams;
-    fds[0] = (struct pollfd){.fd = dns_socket->fd, .events = POLLIN};
+    fds[0] = (struct pollfd){.fd = dns_fd, .events = POLLIN};
     size_t i = 1;
     int timeout = 1000; /* also bound signal/shutdown and connect-deadline latency */
     uint64_t now = picoquic_current_time();
@@ -488,10 +653,7 @@ static int slipstream_server_poll(slipstream_server_ctx_t* default_ctx,
         perror("poll() failed");
         return -1;
     }
-    if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-        fprintf(stderr, "DNS listen socket failed\n");
-        return -1;
-    }
+    *dns_revents = fds[0].revents;
     now = picoquic_current_time();
     for (i = 1; i < count; i++) {
         slipstream_server_stream_ctx_t* stream = streams[i];
@@ -541,21 +703,11 @@ static int slipstream_server_poll(slipstream_server_ctx_t* default_ctx,
     return 0;
 }
 
-int slipstream_server_sockloop_callback(picoquic_quic_t* quic, picoquic_packet_loop_cb_enum cb_mode,
-                                       void* callback_ctx, void* callback_arg) {
-    slipstream_server_ctx_t* default_ctx = callback_ctx;
-    if (cb_mode != picoquic_packet_loop_before_select) {
-        return 0;
-    }
-    if (should_shutdown) {
-        /* A DNS server cannot send a close without a pending query. Do not
-         * wait indefinitely for a disappearing client to poll during shutdown. */
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
-    }
-    /* Without DNS queries, prepare_packet is never called and PicoQUIC's
-     * sender-side idle check does not run. Reap abandoned connections here,
-     * between batches, when no DNS slot retains a connection pointer.
-     * These deadlines mirror the pinned PicoQUIC check_idle_timer(). */
+/* Without DNS queries, prepare_packet is never called and PicoQUIC's
+ * sender-side idle check does not run. Reap abandoned connections here,
+ * between batches, when no DNS slot retains a connection pointer.
+ * These deadlines mirror the pinned PicoQUIC check_idle_timer(). */
+static void slipstream_server_reap(picoquic_quic_t* quic) {
     uint64_t now = picoquic_current_time();
     picoquic_cnx_t* cnx = picoquic_get_first_cnx(quic);
     while (cnx != NULL) {
@@ -583,7 +735,6 @@ int slipstream_server_sockloop_callback(picoquic_quic_t* quic, picoquic_packet_l
         }
         cnx = next;
     }
-    return slipstream_server_poll(default_ctx, callback_arg);
 }
 
 int slipstream_server_callback(picoquic_cnx_t* cnx,
@@ -718,34 +869,329 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
     return 0;
 }
 
-int picoquic_slipstream_server(int server_port, bool listen_ipv6, const struct sockaddr_storage* listen_address,
-                               const char* server_cert, const char* server_key,
-                               struct sockaddr_storage* target_address, const char* domain_name) {
+/* Where queries come from: a UDP socket, or a DNS front over a unix
+ * SOCK_SEQPACKET socket (one front at a time; it reconnects). */
+typedef struct st_server_io_t {
+    int udp_fd;     /* UDP mode */
+    int listen_fd;  /* front mode: the listening socket */
+    int front_fd;   /* front mode: the front's connection, -1 while away */
+    long front_uid;
+} server_io_t;
+
+static int server_open_udp(const slipstream_server_config_t* config) {
+    struct sockaddr_storage addr = {0};
+    socklen_t addr_len;
+    if (config->listen_address != NULL) {
+        addr = *config->listen_address;
+    } else {
+        addr.ss_family = config->listen_ipv6 ? AF_INET6 : AF_INET;
+    }
+    if (addr.ss_family == AF_INET) {
+        ((struct sockaddr_in*)&addr)->sin_port = htons((uint16_t)config->listen_port);
+        addr_len = sizeof(struct sockaddr_in);
+    } else {
+        ((struct sockaddr_in6*)&addr)->sin6_port = htons((uint16_t)config->listen_port);
+        addr_len = sizeof(struct sockaddr_in6);
+    }
+    int fd = socket(addr.ss_family, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+    if (fd < 0) {
+        perror("Unable to create DNS listen socket");
+        return -1;
+    }
+    if (picoquic_socket_set_pkt_info(fd, addr.ss_family) != 0 ||
+        bind(fd, (struct sockaddr*)&addr, addr_len) != 0) {
+        perror("Unable to bind DNS listen socket");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int server_open_front(const char* path) {
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(addr.sun_path)) {
+        fprintf(stderr, "Front socket path too long: %s\n", path);
+        return -1;
+    }
+    strcpy(addr.sun_path, path);
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) {
+        perror("Unable to create front socket");
+        return -1;
+    }
+    /* A socket file left by an earlier run would fail the bind. */
+    (void)unlink(path);
+    /* Who may connect is the directory's business (the front's group) and
+     * front_uid's; the socket itself is for owner and group. */
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || chmod(path, 0660) != 0 || listen(fd, 4) != 0) {
+        perror("Unable to listen on front socket");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* server_accept takes the front's connection: only from front_uid, and only
+ * one; a new one replaces the old (the front reconnected). */
+static void server_accept(server_io_t* io) {
+    int fd = accept4(io->listen_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+    if (fd < 0) {
+        return;
+    }
+    struct ucred cred;
+    socklen_t len = sizeof(cred);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 ||
+        (io->front_uid >= 0 && (long)cred.uid != io->front_uid)) {
+        fprintf(stderr, "Front socket: a peer with UID %ld refused\n", len == sizeof(cred) ? (long)cred.uid : -1L);
+        close(fd);
+        return;
+    }
+    int size = 4 << 20;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+    if (io->front_fd >= 0) {
+        close(io->front_fd);
+    }
+    io->front_fd = fd;
+    fprintf(stderr, "Front connected\n");
+}
+
+static void server_front_gone(server_io_t* io) {
+    if (io->front_fd >= 0) {
+        close(io->front_fd);
+        io->front_fd = -1;
+        fprintf(stderr, "Front disconnected\n");
+    }
+}
+
+/* server_receive reads one query without waiting: 1 with one, 0 with none,
+ * -1 when the UDP socket fails (the front's going away is not an error). */
+static int server_receive(server_io_t* io, uint8_t* buffer, size_t size, size_t* length,
+                          server_slot_t* slot, struct sockaddr_storage* peer, struct sockaddr_storage* local) {
+    memset(peer, 0, sizeof(*peer));
+    memset(local, 0, sizeof(*local));
+    if (io->front_fd < 0 && io->listen_fd >= 0) {
+        return 0;
+    }
+    if (io->front_fd >= 0) {
+        uint8_t message[FRONT_HEADER_LEN + SERVER_MAX_QUERY];
+        ssize_t n = recv(io->front_fd, message, sizeof(message), MSG_DONTWAIT | MSG_TRUNC);
+        if (n < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                server_front_gone(io);
+            }
+            return 0;
+        }
+        if (n == 0) {
+            server_front_gone(io);
+            return 0;
+        }
+        /* MSG_TRUNC gives the full length: a longer message was cut. */
+        if ((size_t)n > sizeof(message) || (size_t)n <= FRONT_HEADER_LEN ||
+            message[0] != 'N' || message[1] != 'U' || message[2] != 1 || (size_t)n - FRONT_HEADER_LEN > size) {
+            *length = 0;
+            return 1;
+        }
+        memcpy(slot->front_addrs, message + 3, FRONT_ADDRS_LEN);
+        *length = (size_t)n - FRONT_HEADER_LEN;
+        memcpy(buffer, message + FRONT_HEADER_LEN, *length);
+        /* QUIC sees a dummy address either way (server_decode). */
+        ((struct sockaddr_in*)peer)->sin_family = AF_INET;
+        ((struct sockaddr_in*)local)->sin_family = AF_INET;
+        return 1;
+    }
+    int if_index = 0;
+    uint8_t ecn = 0;
+    int n = picoquic_recvmsg(io->udp_fd, peer, local, &if_index, &ecn, buffer, (int)size);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return 0;
+        }
+        /* ICMP errors and the like come back on a UDP socket: not fatal. */
+        if (errno == ECONNREFUSED || errno == EHOSTUNREACH || errno == ENETUNREACH) {
+            *length = 0;
+            return 1;
+        }
+        perror("DNS socket receive failed");
+        return -1;
+    }
+    *length = (size_t)n;
+    return 1;
+}
+
+/* server_send sends one answer; a failure drops it. */
+static void server_send(server_io_t* io, const server_slot_t* slot, const uint8_t* answer, size_t length,
+                        struct sockaddr_storage* peer, struct sockaddr_storage* local) {
+    if (io->listen_fd >= 0) {
+        if (io->front_fd < 0 || length > SERVER_MAX_QUERY) {
+            return;
+        }
+        uint8_t message[FRONT_HEADER_LEN + MAX_UDP_PACKET_SIZE];
+        if (length > sizeof(message) - FRONT_HEADER_LEN) {
+            return;
+        }
+        message[0] = 'N';
+        message[1] = 'U';
+        message[2] = 1;
+        memcpy(message + 3, slot->front_addrs, FRONT_ADDRS_LEN);
+        memcpy(message + FRONT_HEADER_LEN, answer, length);
+        ssize_t n = send(io->front_fd, message, FRONT_HEADER_LEN + length, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR && errno != ENOBUFS) {
+            server_front_gone(io);
+        }
+        return;
+    }
+    int sock_err = 0;
+    (void)picoquic_sendmsg(io->udp_fd, (struct sockaddr*)peer, (struct sockaddr*)local, 0,
+        (const char*)answer, (int)length, 0, &sock_err);
+}
+
+/* Stateless packets (version negotiation, stateless resets) would go to the
+ * dummy address and nowhere: the queue grew by one for every long header
+ * of another version. They are dropped as they come. */
+static void server_drop_stateless(picoquic_quic_t* quic) {
+    picoquic_stateless_packet_t* sp;
+    while ((sp = picoquic_dequeue_stateless_packet(quic)) != NULL) {
+        picoquic_delete_stateless_packet(sp);
+    }
+}
+
+/* server_loop answers queries until a signal: each query gets one answer
+ * (the next QUIC packet of its connection, or none) or, when it does not
+ * read, nothing. A bad datagram never ends it. */
+static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_ctx, server_io_t* io) {
+    static server_slot_t slots[PICOQUIC_PACKET_LOOP_RECV_MAX];
+    uint8_t buffer[SERVER_MAX_QUERY];
+    uint8_t send_buffer[PICOQUIC_MAX_PACKET_SIZE];
+    while (!should_shutdown) {
+        slipstream_server_reap(quic);
+        short revents = 0;
+        int dns_fd = io->listen_fd < 0 ? io->udp_fd : (io->front_fd >= 0 ? io->front_fd : io->listen_fd);
+        if (slipstream_server_poll(default_ctx, dns_fd, &revents) != 0) {
+            return -1;
+        }
+        if (io->listen_fd >= 0) {
+            if (io->front_fd < 0) {
+                if (revents & POLLIN) {
+                    server_accept(io);
+                }
+                continue;
+            }
+            if ((revents & (POLLERR | POLLNVAL)) || ((revents & POLLHUP) && !(revents & POLLIN))) {
+                server_front_gone(io);
+                continue;
+            }
+            /* A front that reconnected while this one is up replaces it. */
+            struct pollfd listen_poll = {.fd = io->listen_fd, .events = POLLIN};
+            if (poll(&listen_poll, 1, 0) > 0 && (listen_poll.revents & POLLIN)) {
+                server_accept(io);
+            }
+        } else if (revents & POLLNVAL) {
+            fprintf(stderr, "DNS listen socket failed\n");
+            return -1;
+        }
+
+        size_t nb_slots = 0;
+        while (nb_slots < PICOQUIC_PACKET_LOOP_RECV_MAX) {
+            server_slot_t* slot = &slots[nb_slots];
+            memset(slot, 0, sizeof(*slot));
+            slot->s.path_id = -1;
+            struct sockaddr_storage peer_addr;
+            struct sockaddr_storage local_addr;
+            size_t length = 0;
+            int got = server_receive(io, buffer, sizeof(buffer), &length, slot, &peer_addr, &local_addr);
+            if (got < 0) {
+                return -1;
+            }
+            if (got == 0) {
+                break;
+            }
+            if (length == 0) {
+                continue; /* read, but nothing to answer */
+            }
+            unsigned char* decoded = NULL;
+            ssize_t decoded_len = server_decode(slot, default_ctx, &decoded, buffer, length, &peer_addr, &local_addr);
+            if (decoded_len < 0) {
+                continue; /* no answer: not a query of this tunnel */
+            }
+            slot->answer = true;
+            nb_slots++;
+            if (decoded_len == 0) {
+                continue;
+            }
+            picoquic_cnx_t* last_cnx = NULL;
+            int last_path_id = -1;
+            int ret = picoquic_incoming_packet_ex(quic, decoded, (size_t)decoded_len,
+                (struct sockaddr*)&peer_addr, (struct sockaddr*)&local_addr, 0, 0,
+                &last_cnx, &last_path_id, picoquic_current_time());
+            free(decoded);
+            if (ret != 0 || last_cnx == NULL) {
+                continue; /* answered empty */
+            }
+            slot->s.cnx = last_cnx;
+            slot->s.path_id = last_path_id;
+            last_cnx->no_ack_delay = 1;
+        }
+        server_drop_stateless(quic);
+
+        const uint64_t loop_time = picoquic_current_time();
+        for (size_t i = 0; i < nb_slots; i++) {
+            server_slot_t* slot = &slots[i];
+            if (!slot->answer) {
+                continue;
+            }
+            size_t send_length = 0;
+            struct sockaddr_storage peer_addr = {0};
+            struct sockaddr_storage local_addr = {0};
+            int if_index = 0;
+            if (slot->s.error == RCODE_OKAY && slot->s.cnx != NULL &&
+                picoquic_prepare_packet_ex(slot->s.cnx, slot->s.path_id, loop_time,
+                    send_buffer, sizeof(send_buffer), &send_length,
+                    &peer_addr, &local_addr, &if_index, NULL) != 0) {
+                send_length = 0;
+            }
+            unsigned char* encoded = NULL;
+            size_t segment_len = send_length;
+            ssize_t encoded_len = server_encode(slot, default_ctx, &encoded, send_buffer, send_length,
+                &segment_len, &peer_addr, &local_addr);
+            if (encoded_len <= 0 || encoded == NULL) {
+                free(encoded);
+                continue;
+            }
+            server_send(io, slot, encoded, (size_t)encoded_len, &peer_addr, &local_addr);
+            free(encoded);
+        }
+        server_drop_stateless(quic);
+    }
+    return 0;
+}
+
+int picoquic_slipstream_server(const slipstream_server_config_t* cfg) {
     /* Start: start the QUIC process with cert and key files */
     int ret = 0;
     uint64_t current_time = 0;
     slipstream_server_ctx_t default_context = {0};
 
-    // Store the target address directly - no need to resolve it here anymore
-    memcpy(&default_context.upstream_addr, target_address, sizeof(struct sockaddr_storage));
+    memcpy(&default_context.upstream_addr, &cfg->target, sizeof(struct sockaddr_storage));
 
-    server_domain_name = strdup(domain_name);
-    server_domain_name_len = strlen(domain_name);
+    server_domain_name = strdup(cfg->domain);
+    server_domain_name_len = strlen(cfg->domain);
+    server_tag_len = cfg->tag_len;
+    slipstream_pending_max = cfg->max_pending;
 
-    // int mtu = 250;
     int mtu = 900;
 
     /* Create config */
     picoquic_quic_config_t config;
     picoquic_config_init(&config);
-    config.nb_connections = 8;
-    config.server_cert_file = server_cert;
-    config.server_key_file = server_key;
-    // config.log_file = "-";
+    config.nb_connections = cfg->max_connections;
+    config.server_cert_file = cfg->cert;
+    config.server_key_file = cfg->key;
 #ifdef BUILD_LOGLIB
     config.qlog_dir = SLIPSTREAM_QLOG_DIR;
 #endif
-    config.server_port = server_port;
+    config.server_port = cfg->listen_port;
     config.mtu_max = mtu;
     config.initial_send_mtu_ipv4 = mtu;
     config.initial_send_mtu_ipv6 = mtu;
@@ -753,16 +1199,19 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, const struct s
     config.use_long_log = 1;
     config.do_preemptive_repeat = 1;
     config.disable_port_blocking = 1;
-    config.enable_sslkeylog = 1;
-    config.alpn = SLIPSTREAM_ALPN;
-
+    /* No key log: SSLKEYLOGFILE would write the session keys out. */
+    config.enable_sslkeylog = 0;
+    config.alpn = cfg->alpn;
+    /* 0 left connections without a limit: a client that went away kept
+     * its place until a restart. */
+    config.idle_timeout = (int)cfg->idle_timeout_ms;
 
     /* Create the QUIC context for the server */
     current_time = picoquic_current_time();
     /* Create QUIC context */
     picoquic_quic_t* quic = picoquic_create_and_configure(&config, slipstream_server_callback, &default_context, current_time, NULL);
     if (quic == NULL) {
-        DBG_PRINTF("Could not create server context", NULL);
+        fprintf(stderr, "Could not create server context\n");
         free(server_domain_name);
         server_domain_name = NULL;
         return -1;
@@ -774,45 +1223,40 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, const struct s
     picoquic_set_qlog(quic, config.qlog_dir);
     debug_printf_push_stream(stderr);
 #endif
-    picoquic_set_key_log_file_from_env(quic);
-    // picoquic_set_textlog(quic, "-");
-    // picoquic_set_log_level(quic, 1);
-
     picoquic_set_default_congestion_algorithm(quic, slipstream_server_cc_algorithm);
+    picoquic_tp_t tp = *picoquic_get_default_tp(quic);
+    tp.initial_max_stream_id_bidir = cfg->max_streams;
+    tp.initial_max_stream_id_unidir = 0;
+    picoquic_set_default_tp(quic, &tp);
 
-    picoquic_packet_loop_param_t param = {0};
-    if (listen_address != NULL) {
-        param.local_af = listen_address->ss_family;
-    } else if (listen_ipv6) {
-        param.local_af = AF_INET6;
+    server_io_t io = {.udp_fd = -1, .listen_fd = -1, .front_fd = -1, .front_uid = cfg->front_uid};
+    if (cfg->front_socket != NULL) {
+        io.listen_fd = server_open_front(cfg->front_socket);
     } else {
-        param.local_af = AF_INET;
+        io.udp_fd = server_open_udp(cfg);
     }
-    param.local_port = server_port;
-    param.do_not_use_gso = 1; // can't use GSO since we're limited to responding to one DNS query at a time
-    param.is_client = 0;
-    param.decode = server_decode;
-    param.encode = server_encode;
-    // param.delay_max = 5000;
-
-    picoquic_network_thread_ctx_t thread_ctx = {0};
-    thread_ctx.quic = quic;
-    thread_ctx.param = &param;
-    thread_ctx.loop_callback = slipstream_server_sockloop_callback;
-    thread_ctx.loop_callback_ctx = &default_context;
-
-    signal(SIGTERM, server_sighandler);
-    signal(SIGINT, server_sighandler);
-    // picoquic_packet_loop_v3(&thread_ctx);
-    slipstream_packet_loop(&thread_ctx, listen_address);
-    ret = thread_ctx.return_code;
-    if (ret == PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP) {
-        ret = 0;
+    if (io.udp_fd < 0 && io.listen_fd < 0) {
+        ret = -1;
+    } else {
+        signal(SIGTERM, server_sighandler);
+        signal(SIGINT, server_sighandler);
+        signal(SIGPIPE, SIG_IGN);
+        ret = server_loop(quic, &default_context, &io);
     }
 
     /* And finish. */
     DBG_PRINTF("Server exit, ret = %d", ret);
 
+    if (io.front_fd >= 0) {
+        close(io.front_fd);
+    }
+    if (io.listen_fd >= 0) {
+        close(io.listen_fd);
+        (void)unlink(cfg->front_socket);
+    }
+    if (io.udp_fd >= 0) {
+        close(io.udp_fd);
+    }
     /* Also cover packet-loop errors: PicoQUIC does not promise a close
      * callback for every connection when its entire context is freed. */
     while (default_context.next_ctx != NULL) {
@@ -828,4 +1272,3 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, const struct s
 
     return ret;
 }
-
