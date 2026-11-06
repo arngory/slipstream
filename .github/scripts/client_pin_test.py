@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""The client's TLS toward the server on the loopback (slipstream-v1): the pinned key carries the request whatever the
-SNI says, another key and a client without --pin (and without --insecure) carry nothing, and the client listens on
-the loopback only. Usage: client_pin_test.py <the meson build directory>."""
+"""The client on the loopback against the server (slipstream-v1).
+
+TLS: the pinned key carries the request whatever the SNI says, another key and a client without --pin (and without
+--insecure) carry nothing, the client listens on the loopback only. Streams through the pinned client: one after
+another and side by side, a request ended by a half-close still gets its answer, and a large upload and download
+arrive whole. Usage: client_pin_test.py <the meson build directory>."""
 import base64
 import hashlib
 import os
@@ -32,8 +35,13 @@ def cert(name):
     return key, crt, base64.urlsafe_b64encode(hashlib.sha256(der).digest()).rstrip(b"=").decode()
 
 
+def pattern(n):
+    return bytes(i % 251 for i in range(n))
+
+
 def target():
-    """the service behind the server: it answers the line it is sent"""
+    """the service behind the server. "upload": reads to the end, answers its size and SHA-256; "download N": sends N
+    bytes of the pattern; any other line: answered back"""
     listener = socket.socket()
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", TARGET_PORT))
@@ -41,8 +49,15 @@ def target():
 
     def answer(conn):
         with conn:
-            line = conn.makefile("rb").readline()
-            conn.sendall(b"answer to " + line)
+            reader = conn.makefile("rb")
+            line = reader.readline()
+            if line == b"upload\n":
+                data = reader.read()
+                conn.sendall(b"got %d %s\n" % (len(data), hashlib.sha256(data).hexdigest().encode()))
+            elif line.startswith(b"download "):
+                conn.sendall(pattern(int(line.split()[1])))
+            else:
+                conn.sendall(b"answer to " + line)
 
     while True:
         conn, _ = listener.accept()
@@ -56,25 +71,39 @@ def start(name, args):
     return proc
 
 
-def ask(port, deadline):
+def exchange(port, request, half_close, timeout):
+    """one connection through the client on port: the request, the half-close if asked, then all the answer"""
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+        conn.settimeout(timeout)
+        conn.sendall(request)
+        if half_close:
+            conn.shutdown(socket.SHUT_WR)
+        data = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return data
+            data += chunk
+
+
+def ask(port, deadline, request=b"hello\n"):
     """the answer through the client on port, or b"" when none came before the deadline"""
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
-                conn.settimeout(max(1.0, deadline - time.monotonic()))
-                conn.sendall(b"hello\n")
-                data = b""
-                while True:
-                    chunk = conn.recv(1024)
-                    if not chunk:
-                        break
-                    data += chunk
-                if data:
-                    return data
+            data = exchange(port, request, False, max(1.0, deadline - time.monotonic()))
+            if data:
+                return data
         except OSError:
             pass
         time.sleep(1)
     return b""
+
+
+def check(name, got, want):
+    shown = got if len(got) <= 80 else b"%d bytes" % len(got)
+    print("%s: %r" % (name, shown))
+    if got != want:
+        failures.append("%s: %r, want %r" % (name, shown, want if len(want) <= 80 else b"%d bytes" % len(want)))
 
 
 def client(name, port, *extra):
@@ -120,10 +149,42 @@ try:
 
     for name, port, want in (("pinned", 7001, b"answer to hello\n"), ("insecure", 7002, b"answer to hello\n"),
                              ("other key", 7003, b"")):
-        got = ask(port, time.monotonic() + (60 if want else 20))
-        print("%s: %r" % (name, got))
-        if got != want:
-            failures.append("%s: %r, want %r" % (name, got, want))
+        check(name, ask(port, time.monotonic() + (60 if want else 20)), want)
+
+    # the streams through the pinned client, now connected
+    for i in range(20):
+        request = b"hello %d\n" % i
+        check("one after another %d" % i, exchange(7001, request, False, 30), b"answer to " + request)
+
+    answers = {}
+
+    def side_by_side(i):
+        request = b"side by side %d\n" % i
+        try:
+            answers[i] = (exchange(7001, request, False, 60), b"answer to " + request)
+        except OSError as e:
+            answers[i] = (repr(e).encode(), b"answer to " + request)
+
+    threads = [threading.Thread(target=side_by_side, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    for i in sorted(answers):
+        check("side by side %d" % i, *answers[i])
+
+    # the request ends with a half-close: the answer still comes (a reset in its place lost it)
+    empty = hashlib.sha256(b"").hexdigest().encode()
+    check("a half-close", exchange(7001, b"upload\n", True, 30), b"got 0 " + empty + b"\n")
+    upload = pattern(512 * 1024)
+    started = time.monotonic()
+    check("an upload", exchange(7001, b"upload\n" + upload, True, 180),
+          b"got %d %s\n" % (len(upload), hashlib.sha256(upload).hexdigest().encode()))
+    print("  %.1f s" % (time.monotonic() - started))
+    started = time.monotonic()
+    check("a download", exchange(7001, b"download %d\n" % (1024 * 1024), False, 180), pattern(1024 * 1024))
+    print("  %.1f s" % (time.monotonic() - started))
+    check("after them", exchange(7001, b"hello again\n", False, 30), b"answer to hello again\n")
 finally:
     for name, proc in procs:
         proc.terminate()
@@ -138,4 +199,4 @@ finally:
 
 if failures:
     sys.exit("\n".join(failures))
-print("the pin holds")
+print("the pin holds, the streams arrive whole")
