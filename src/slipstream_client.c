@@ -538,7 +538,7 @@ void* slipstream_client_accepter(void* arg) {
         uint16_t client_port = ntohs(client_addr.sin_port);
 
         // Print the connection details
-        fprintf(stderr, "Accepted connection from %s:%u on socket %d\n", client_ip_str, client_port, client_sock);
+        printf("Accepted connection from %s:%u on socket %d\n", client_ip_str, client_port, client_sock);
         // --- End printing section ---
 
         slipstream_client_stream_ctx_t* stream_ctx = slipstream_client_create_stream_ctx(args->cnx, args->client_ctx, client_sock);

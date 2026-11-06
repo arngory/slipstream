@@ -286,6 +286,7 @@ try:
     client("tagged", 7004, "--pin=" + pin, "--dnsauth", resolver=8854, env={"SLIPSTREAM_DNSAUTH_KEY": DNSAUTH_KEY})
     client("tagged, another key", 7005, "--pin=" + pin, "--dnsauth", resolver=8855,
            env={"SLIPSTREAM_DNSAUTH_KEY": "11" * 32})
+    client("quiet", 7007, "--pin=" + pin, "--quiet")
     client("tagged, another clock", 7006, "--pin=" + pin, "--dnsauth", "--clock-offset=3600", resolver=8856,
            env={"SLIPSTREAM_DNSAUTH_KEY": DNSAUTH_KEY})
     check("tagged", ask(7004, time.monotonic() + 60), b"answer to hello\n")
@@ -294,6 +295,7 @@ try:
           b"got %d %s\n" % (len(upload), hashlib.sha256(upload).hexdigest().encode()))
     check("tagged, another key", ask(7005, time.monotonic() + 20), b"")
     check("tagged, another clock", ask(7006, time.monotonic() + 20), b"")
+    check("quiet", ask(7007, time.monotonic() + 60), b"answer to hello\n")
     print("fronts: the key %s, another key %s, another clock %s" % (tagged_front, other_front, clock_front))
     if tagged_front["passed"] == 0 or tagged_front["refused"] != 0:
         failures.append("the key's front: %s, want every query passed" % tagged_front)
@@ -311,6 +313,13 @@ finally:
         with open(os.path.join(WORK, name + ".log"), "rb") as log:
             tail = log.read()[-3000:].decode(errors="replace")
         print("--- %s (exit %s)\n%s" % (name, proc.returncode, tail))
+
+# --quiet: nothing on stdout, the streams it carried included (start() puts stdout and stderr in one log, and stderr
+# is empty when all went well)
+with open(os.path.join(WORK, "quiet.log"), "rb") as log:
+    quiet_log = log.read()
+if quiet_log.strip():
+    failures.append("quiet: it wrote %r" % quiet_log[:300])
 
 if failures:
     sys.exit("\n".join(failures))

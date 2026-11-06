@@ -1,3 +1,4 @@
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -25,6 +26,7 @@ struct ClientArgs : MainArguments<ClientArgs> {
     bool insecure = option("insecure", '\0', "Take any certificate the server shows (no --pin): the tunnel is open to whoever answers");
     bool dnsauth = option("dnsauth", '\0', "dnsauth-v2 on every query with the device's key from SLIPSTREAM_DNSAUTH_KEY (64 hex)");
     int clock_offset = option("clock-offset", '\0', "With --dnsauth: the node's clock less this one, in seconds (default: 0)") = 0;
+    bool quiet = option("quiet", 'q', "Nothing on stdout (a line per stream event there); errors stay on stderr");
 
     static std::string help(const std::string& program_name) {
         return "slipstream-client - A high-performance covert channel over DNS (client)\n\n" 
@@ -49,6 +51,11 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    // the stream events stay out of the log of whoever runs the client (Niko writes each line of it)
+    if (args.quiet && freopen("/dev/null", "w", stdout) == NULL) {
+        std::cerr << "Client error: --quiet: " << strerror(errno) << std::endl;
+        exit(1);
+    }
     // Ensure output buffers are flushed immediately (useful for debugging/logging)
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);

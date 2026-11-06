@@ -56,6 +56,8 @@ device's key for the service comes from the environment, `SLIPSTREAM_DNSAUTH_KEY
 which other processes may read), and `--clock-offset` moves the clock its epoch is counted on (the node's time less
 this one, in seconds). The node's front checks the field and passes the packet on without it.
 
+`--quiet` keeps stdout empty (it has a line per stream event); errors still go to stderr.
+
 The client exits with 1 on bad arguments, 2 when the handshake fails (the server does not answer, or refuses), and
 3 when the server's key is not the pinned one.
 
