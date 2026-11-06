@@ -55,6 +55,7 @@ python3 "$here/replay.py" 25301 25300 "$work/replay.status" & pids+=($!)
 "$build/slipstream-client" -l 25401 -r 127.0.0.1:25301 -d t.example >client-replay.log 2>&1 & pids+=($!)
 sleep 2
 echo_through 25401 || fail "echo with copies of the queries"
+sleep 3 # the late copies
 read -r _ copies _ with_data < "$work/replay.status" || fail "no copies answered"
 [ "$copies" -gt 50 ] || fail "only $copies copies answered"
 [ "$with_data" = 0 ] || fail "$with_data of $copies copies got the connection's data"

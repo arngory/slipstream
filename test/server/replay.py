@@ -3,7 +3,8 @@ could send them (slipstream-v1 §1 item 5).
 
 replay.py UDP_PORT SERVER_PORT STATUS_FILE: a UDP proxy on 127.0.0.1:UDP_PORT
 to the server on 127.0.0.1:SERVER_PORT. Each query goes on as it came, and
-once it has been answered, a copy with another ID goes from a second socket.
+once it has been answered, a copy with another ID goes from a second socket,
+and again 2 s later.
 A copy must get an empty answer: the server already had its packet, and the
 connection's next packet belongs to the client. STATUS_FILE gets
 "copies N with-data M" as they come.
@@ -42,8 +43,11 @@ def answers():
             q = pending.pop(question(m), None)
         if q is not None:
             # The copy goes once the original is answered: the server took
-            # its packet by then.
-            spy.sendto(bytes([q[0] ^ 0x5a, q[1]]) + q[2:], server)
+            # its packet by then. Another goes 2 s later, when picoquic has
+            # forgotten the packet's number (review).
+            c = bytes([q[0] ^ 0x5a, q[1]]) + q[2:]
+            spy.sendto(c, server)
+            threading.Timer(2.0, spy.sendto, (c, server)).start()
 
 
 def copy_answers():

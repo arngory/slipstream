@@ -56,18 +56,22 @@ socket is created with mode 0660; who reaches it is the directory's business, an
 - Key log: never written. `SSLKEYLOGFILE` is ignored.
 - Copies of a packet: a query is bound to a connection, and gets its next packet, only when picoquic took the
   query's packet as new. A copy (anyone on the path can resend a query, from any address) or a packet that does not
-  open names the connection all the same; it is answered empty. picoquic forgot the packet numbers it had
-  received once the peer acknowledged its ACK, and took a copy of an older packet as new: every ACK context keeps an
-  ACK horizon of 10 s (everything below it counts as received).
+  open names the connection all the same; it is answered empty. picoquic does not always know a copy: once the peer
+  has acknowledged an ACK, the highest range of received numbers starts after it, and what was cut off counts as
+  never received. So the server remembers the packets picoquic took, by a hash of their bytes, for 30 to 60 s (two
+  generations of 2^18 slots, 4 MiB; a full one turns early), and a copy goes no further. Beyond that, every 1-RTT
+  ACK context keeps an ACK horizon (10 s, raised to the lowest range kept): what lies below it counts as received.
+  A packet older than the horizon that was never received is dropped; QUIC sends its frames again. In front mode
+  the front refuses copies for as long as their tag holds.
 - Streams: the client's bidirectional ones only (`--max-streams`). The client opens no other: a unidirectional
   stream closes the connection (refused one by one, their records stayed until it ended). The transport
   parameters allow one (picoquic reads 0 as no limit).
 - The UDP socket does not block: a lone query is answered at once, and SIGTERM ends the loop.
-- Paths (multipath): a path that went away since its query is looked up again by its unique ID before the answer,
-  and one abandoned since is not used. A connection with every path abandoned goes (prepare would take a path
+- Paths (multipath): a path that went away since its query is looked up again by its unique ID before the answer;
+  one abandoned since, or still without the peer's connection ID, is not used: the first path that has one is named. A connection with every path abandoned goes (prepare would take a path
   without a connection ID, or none, and crash); a connection with none left is reaped.
 - Bytes for a target go to its socket at once when nothing waits before them. One connection queues
-  `--max-pending-mib` over `--max-connections` at most, 1 MiB at least.
+  `--max-pending-mib` over `--max-connections` at most, 4 MiB (four streams' limit) at least.
 - Descriptors: a target socket per stream, and a connection may have about 1.5 times `--max-streams` at once
   (picoquic opens the next ones before the closed ones go). The soft limit goes up to the hard one; below
   `--max-connections` × `--max-streams` × 1.5 + 64 the server warns (raise LimitNOFILE). Out of descriptors,
@@ -77,8 +81,8 @@ socket is created with mode 0660; who reaches it is the directory's business, an
 
 `test/server/run.sh build` runs:
 - an echo through the tunnel over UDP;
-- an echo with a copy of every query sent from another address once answered (`replay.py`): every copy must be
-  answered empty;
+- an echo with a copy of every query sent from another address once answered, and again 2 s later (`replay.py`):
+  every copy must be answered empty;
 - an echo through a stand-in front, with and without an 8-byte tag;
 - hostile and mutated queries, after which the server must still be up;
 - a stranger on the front socket, who must be refused;

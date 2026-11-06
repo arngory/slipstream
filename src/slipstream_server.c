@@ -23,6 +23,7 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
+#include <sys/random.h>
 #include <assert.h>
 #include <picoquic_internal.h>
 #include <slipstream_sockloop.h>
@@ -618,9 +619,9 @@ static int slipstream_server_queue(slipstream_server_stream_ctx_t* stream_ctx,
         return -1;
     }
     /* One connection takes its share of the budget at most (the budget
-     * over --max-connections, 1 MiB at least): it cannot starve the others
-     * (review: a quarter let four take it all). */
-    const size_t share = MAX(slipstream_pending_max / MAX(slipstream_max_connections, (size_t)1), (size_t)SLIPSTREAM_PENDING_LIMIT);
+     * over --max-connections, four streams' limit at least): it cannot
+     * starve the others (review: a quarter let four take it all). */
+    const size_t share = MAX(slipstream_pending_max / MAX(slipstream_max_connections, (size_t)1), (size_t)4 * SLIPSTREAM_PENDING_LIMIT);
     if (length > share - MIN(share, stream_ctx->owner->pending_bytes)) {
         fprintf(stderr, "A connection's write queues hold %zu bytes, its share: stream %llu dropped\n",
             stream_ctx->owner->pending_bytes, (unsigned long long)stream_ctx->stream_id);
@@ -1144,19 +1145,108 @@ static void server_drop_stateless(picoquic_quic_t* quic) {
  * next packet). 10 s: a resolver's retries come within it. */
 #define SERVER_ACK_HORIZON_US (10 * 1000000LL)
 
-/* Gives each ACK context of cnx the horizon delay: the packet number spaces,
- * and each path's own in multipath (paths come and go). */
+/* Keeps a sack list's received packet numbers: the horizon delay, and the
+ * horizon raised to the lowest range kept. picoquic also moves the start of
+ * the highest range up once the peer acknowledged the ACK that carried it,
+ * whatever the delay: the numbers below it were received, and would be
+ * taken again. Below the lowest range is what was received and forgotten,
+ * or lost: a packet that comes later than that is dropped, and QUIC sends
+ * its frames again. */
+static void server_keep_sack(picoquic_sack_list_t* sack_list) {
+    if (sack_list->horizon_delay == 0) {
+        sack_list->horizon_delay = SERVER_ACK_HORIZON_US;
+    }
+    picoquic_sack_item_t* first = picoquic_sack_first_item(sack_list);
+    if (first != NULL && first->start_of_sack_range > sack_list->ack_horizon) {
+        sack_list->ack_horizon = first->start_of_sack_range;
+    }
+}
+
+/* Keeps the received packet numbers of cnx's 1-RTT packets, those a copy
+ * would carry once the handshake is done: its application context, and each
+ * path's own in multipath (paths come and go). Initial and Handshake are left
+ * as they are: a ClientHello in two packets may come in reversed. */
 static void server_keep_horizon(picoquic_cnx_t* cnx) {
-    for (int pc = 0; pc < picoquic_nb_packet_context; pc++) {
-        if (cnx->ack_ctx[pc].sack_list.horizon_delay == 0) {
-            cnx->ack_ctx[pc].sack_list.horizon_delay = SERVER_ACK_HORIZON_US;
-        }
-    }
+    server_keep_sack(&cnx->ack_ctx[picoquic_packet_context_application].sack_list);
     for (int k = 0; k < cnx->nb_paths; k++) {
-        if (cnx->path[k] != NULL && cnx->path[k]->ack_ctx.sack_list.horizon_delay == 0) {
-            cnx->path[k]->ack_ctx.sack_list.horizon_delay = SERVER_ACK_HORIZON_US;
+        if (cnx->path[k] != NULL) {
+            server_keep_sack(&cnx->path[k]->ack_ctx.sack_list);
         }
     }
+}
+
+/* The packets picoquic took, by a hash of their bytes, for 30 to 60 s: a
+ * copy is the same bytes, and picoquic does not always know it for one
+ * (once the peer has acknowledged an ACK, the highest range of received
+ * numbers starts after it, and what was cut off counts as never received
+ * until the horizon reaches it). A copy goes no further than this. Two
+ * generations of open addressing, the older dropped every 30 s, or early
+ * when the newer is half full (a heavy load: ~4000 packets a second). */
+#define SEEN_SLOTS (1u << 18)
+#define SEEN_GENERATION_US (30 * 1000000ULL)
+typedef struct {
+    uint64_t* gens[2]; /* SEEN_SLOTS each; 0 is a free slot */
+    size_t count;      /* in gens[0] */
+    uint64_t started;  /* gens[0]'s start */
+    uint64_t seed;
+} seen_packets_t;
+static seen_packets_t seen_packets;
+
+static uint64_t seen_hash(const uint8_t* bytes, size_t len) {
+    uint64_t h = 1469598103934665603ULL ^ seen_packets.seed;
+    for (size_t i = 0; i < len; i++) {
+        h ^= bytes[i];
+        h *= 1099511628211ULL;
+    }
+    h ^= h >> 29;
+    return h != 0 ? h : 1;
+}
+
+static bool seen_in(const uint64_t* gen, uint64_t h) {
+    for (uint32_t i = (uint32_t)h & (SEEN_SLOTS - 1);; i = (i + 1) & (SEEN_SLOTS - 1)) {
+        if (gen[i] == 0) {
+            return false;
+        }
+        if (gen[i] == h) {
+            return true;
+        }
+    }
+}
+
+/* Whether a packet of this hash was taken in the last 30 to 60 s. */
+static bool seen_packet(uint64_t h, uint64_t now) {
+    if (seen_packets.gens[0] == NULL) {
+        return false;
+    }
+    if (now - seen_packets.started >= SEEN_GENERATION_US) {
+        uint64_t* old = seen_packets.gens[1];
+        seen_packets.gens[1] = seen_packets.gens[0];
+        memset(old, 0, SEEN_SLOTS * sizeof(*old));
+        seen_packets.gens[0] = old;
+        seen_packets.count = 0;
+        seen_packets.started = now;
+    }
+    return seen_in(seen_packets.gens[0], h) || seen_in(seen_packets.gens[1], h);
+}
+
+/* Remembers a packet picoquic took. */
+static void seen_take(uint64_t h, uint64_t now) {
+    if (seen_packets.gens[0] == NULL) {
+        return;
+    }
+    if (seen_packets.count >= SEEN_SLOTS / 2) {
+        seen_packets.started = now - SEEN_GENERATION_US; /* the next look turns */
+        (void)seen_packet(h, now);
+    }
+    uint32_t i = (uint32_t)h & (SEEN_SLOTS - 1);
+    while (seen_packets.gens[0][i] != 0) {
+        if (seen_packets.gens[0][i] == h) {
+            return;
+        }
+        i = (i + 1) & (SEEN_SLOTS - 1);
+    }
+    seen_packets.gens[0][i] = h;
+    seen_packets.count++;
 }
 
 /* A path a packet can go on: not demoted, with the peer's connection ID. */
@@ -1175,6 +1265,16 @@ static bool server_has_path(const picoquic_cnx_t* cnx) {
         }
     }
     return false;
+}
+
+/* The first path of cnx a packet can go on; there is one (server_has_path). */
+static int server_first_path(const picoquic_cnx_t* cnx) {
+    for (int k = 0; k < cnx->nb_paths; k++) {
+        if (server_path_usable(cnx->path[k])) {
+            return k;
+        }
+    }
+    return 0;
 }
 
 static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_ctx, server_io_t* io) {
@@ -1263,6 +1363,11 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
                 receive_time = last_receive_time + 1;
             }
             last_receive_time = receive_time;
+            const uint64_t packet_hash = seen_hash(decoded, (size_t)decoded_len);
+            if (seen_packet(packet_hash, receive_time)) {
+                free(decoded);
+                continue; /* a copy: answered empty */
+            }
             int ret = picoquic_incoming_packet_ex(quic, decoded, (size_t)decoded_len,
                 (struct sockaddr*)&peer_addr, (struct sockaddr*)&local_addr, 0, 0,
                 &last_cnx, &last_path_id, receive_time);
@@ -1273,6 +1378,7 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
             if (ret != 0 || last_cnx == NULL || last_cnx->latest_receive_time != receive_time) {
                 continue; /* answered empty */
             }
+            seen_take(packet_hash, receive_time);
             slot->s.cnx = last_cnx;
             slot->s.path_id = last_path_id;
             if (last_path_id >= 0 && last_path_id < last_cnx->nb_paths && last_cnx->path[last_path_id] != NULL) {
@@ -1321,13 +1427,18 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
                     picoquic_delete_abandoned_paths(cnx, loop_time, &next_wake);
                 }
                 slot->s.path_id = picoquic_find_path_by_unique_id(cnx, slot->unique_path_id);
-                if (slot->s.path_id >= 0 && !server_path_usable(cnx->path[slot->s.path_id])) {
-                    slot->s.path_id = -1; /* abandoned since: prepare picks one */
-                }
                 if (!server_has_path(cnx)) {
                     picoquic_connection_disconnect(cnx);
                     slot->s.cnx = NULL;
                 }
+            }
+            if (slot->s.error == RCODE_OKAY && slot->s.cnx != NULL &&
+                (slot->s.path_id < 0 || !server_path_usable(slot->s.cnx->path[slot->s.path_id]))) {
+                /* The slot's path gone, abandoned, or never known: a path
+                 * a packet can go on, named. Left to picoquic (-1), it may
+                 * take one still waiting for the peer's connection ID
+                 * (review). */
+                slot->s.path_id = server_first_path(slot->s.cnx);
             }
             if (slot->s.error == RCODE_OKAY && slot->s.cnx != NULL &&
                 picoquic_prepare_packet_ex(slot->s.cnx, slot->s.path_id, loop_time,
@@ -1364,6 +1475,18 @@ int picoquic_slipstream_server(const slipstream_server_config_t* cfg) {
     server_tag_len = cfg->tag_len;
     slipstream_pending_max = cfg->max_pending;
     slipstream_max_connections = cfg->max_connections;
+
+    /* The packets taken, for copies (4 MiB). */
+    seen_packets.gens[0] = calloc(SEEN_SLOTS, sizeof(uint64_t));
+    seen_packets.gens[1] = calloc(SEEN_SLOTS, sizeof(uint64_t));
+    if (seen_packets.gens[0] == NULL || seen_packets.gens[1] == NULL) {
+        fprintf(stderr, "Could not allocate the memory of packets taken\n");
+        return -1;
+    }
+    if (getrandom(&seen_packets.seed, sizeof(seen_packets.seed), 0) != (ssize_t)sizeof(seen_packets.seed)) {
+        seen_packets.seed = picoquic_current_time();
+    }
+    seen_packets.started = picoquic_current_time();
 
     /* A target socket per stream: a connection may have about 1.5 times
      * --max-streams at once (picoquic opens the next ones before the
