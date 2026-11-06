@@ -48,6 +48,36 @@ jobs:
       - name: The pin, dnsauth-v2 and the streams on the loopback
         run: python3 .github/scripts/client_pin_test.py meson-build-release
 
+  server-interop:
+    name: Against the hardened server
+    runs-on: ubuntu-latest
+    env:
+      # the server's branch as its session pins it for interop (server/hardening)
+      SERVER_COMMIT: 4f4143421bae2dad2139f5e0aa328d0f380e6d8d
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ env.SERVER_COMMIT }}
+          path: server-src
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt install -y cmake git pkg-config libssl-dev ninja-build gcc g++ python3-pip
+          pip3 install meson
+
+      - name: Build this client and that server
+        run: |
+          meson setup --buildtype=release --warnlevel=0 build-client > /dev/null && ninja -C build-client slipstream-client
+          (cd server-src && meson setup --buildtype=release --warnlevel=0 build > /dev/null && ninja -C build slipstream-server)
+
+      - name: The client against the server
+        run: python3 .github/scripts/server_interop.py build-client server-src/build
+
   android:
     name: Android (${{ matrix.abi }})
     runs-on: ubuntu-latest

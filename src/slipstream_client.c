@@ -837,7 +837,7 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
 int picoquic_slipstream_client(const char* listen_host, int listen_port, struct st_address_t* server_addresses,
                                size_t server_address_count, const char* domain_name, const char* cc_algo_id, bool gso,
                                const size_t keep_alive_interval, const slipstream_client_tls_t* tls,
-                               const slipstream_client_dnsauth_t* dnsauth) {
+                               const slipstream_client_dnsauth_t* dnsauth, uint64_t idle_timeout_ms) {
     /* Start: start the QUIC process */
     int ret = 0;
     uint64_t current_time = 0;
@@ -902,7 +902,11 @@ int picoquic_slipstream_client(const char* listen_host, int listen_port, struct 
     }
     // picoquic_set_textlog(quic, "-");
     // picoquic_set_log_level(quic, 1);
-    // TODO: idle timeout?
+    /* a connection whose server went silent ends (and with it the client, which its runner starts anew) instead of
+     * holding on forever; the handshake waits 30 s whatever the idle timeout, so a server that never answers is told
+     * apart soon (exit 2) */
+    picoquic_set_default_idle_timeout(quic, idle_timeout_ms);
+    picoquic_set_default_handshake_timeout(quic, 30000000);
 
     /* Parse the server addresses directly */
     client_ctx.server_addresses = server_addresses;

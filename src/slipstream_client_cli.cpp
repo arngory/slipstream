@@ -27,6 +27,7 @@ struct ClientArgs : MainArguments<ClientArgs> {
     bool dnsauth = option("dnsauth", '\0', "dnsauth-v2 on every query with the device's key from SLIPSTREAM_DNSAUTH_KEY (64 hex)");
     int clock_offset = option("clock-offset", '\0', "With --dnsauth: the node's clock less this one, in seconds (default: 0)") = 0;
     bool quiet = option("quiet", 'q', "Nothing on stdout (a line per stream event there); errors stay on stderr");
+    int idle_timeout = option("idle-timeout", '\0', "Seconds without a sign of the server before the connection ends, then the client (default: 120, as the server's)") = 120;
 
     static std::string help(const std::string& program_name) {
         return "slipstream-client - A high-performance covert channel over DNS (client)\n\n" 
@@ -80,6 +81,10 @@ int main(int argc, char** argv) {
     struct in_addr listen_in;
     if (inet_pton(AF_INET, args.listen_host.c_str(), &listen_in) != 1) {
         std::cerr << "Client error: --tcp-listen-host is not an IPv4 address: " << args.listen_host << std::endl;
+        exit(1);
+    }
+    if (args.idle_timeout < 5 || args.idle_timeout > 3600) {
+        std::cerr << "Client error: --idle-timeout is 5 to 3600 seconds" << std::endl;
         exit(1);
     }
     if (args.alpn.empty() || args.alpn.size() > 255 || args.sni.empty()) {
@@ -176,7 +181,8 @@ int main(int argc, char** argv) {
         args.gso,
         args.keep_alive_interval,
         &tls,
-        args.dnsauth ? &dnsauth_conf : NULL
+        args.dnsauth ? &dnsauth_conf : NULL,
+        (uint64_t)args.idle_timeout * 1000
     );
     OPENSSL_cleanse(&dnsauth_conf, sizeof(dnsauth_conf));
 
