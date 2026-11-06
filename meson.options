@@ -1,3 +1,8 @@
 # Enable picoquic-log
 option('build_loglib', type : 'boolean', value: false)
 
+# Link OpenSSL statically (picoquic's FindOpenSSL)
+option('static_openssl', type : 'boolean', value: false)
+
+# Link OpenSSL statically (picoquic's FindOpenSSL)
+option('static_openssl', type : 'boolean', value: false)

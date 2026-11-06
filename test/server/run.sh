@@ -5,9 +5,13 @@
 # SSLKEYLOGFILE writes nothing.
 #
 #   test/server/run.sh [BUILD_DIR]     (default: build)
+#
+# SLIPSTREAM_SERVER: another server binary (the static build) against the
+# client of BUILD_DIR.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 build="$(cd "${1:-build}" && pwd)"
+server_bin="$(realpath "${SLIPSTREAM_SERVER:-$build/slipstream-server}")"
 work="$(mktemp -d)"
 pids=()
 cleanup() { kill "${pids[@]}" 2>/dev/null || true; rm -rf "$work"; }
@@ -16,7 +20,7 @@ cd "$work"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout key.pem -out cert.pem \
   -days 1 -subj /CN=x 2>/dev/null
 python3 "$here/echo.py" 25201 & pids+=($!)
-server() { "$build/slipstream-server" -a 127.0.0.1:25201 -c cert.pem -k key.pem -d t.example -n picoquic_sample "$@" & pids+=($!); }
+server() { "$server_bin" -a 127.0.0.1:25201 -c cert.pem -k key.pem -d t.example -n picoquic_sample "$@" & pids+=($!); }
 echo_through() { # port
   timeout 90 python3 - "$1" <<'PY'
 import socket, os, sys

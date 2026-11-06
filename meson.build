@@ -90,6 +90,11 @@ else
   )
 endif
 
+# OpenSSL linked in (a static server for any Linux: .github/scripts/server-static.sh)
+if get_option('static_openssl')
+  picoquic_opts.add_cmake_defines({'OPENSSL_USE_STATIC_LIBS': 'TRUE'})
+endif
+
 # Reference picoquic as a CMake subproject
 picoquic_proj = cmake.subproject(
   'picoquic',

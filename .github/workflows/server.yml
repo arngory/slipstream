@@ -1,0 +1,53 @@
+name: Server
+
+# The server as raycontrol ships it (spec slipstream-v1 §5): static (Alpine,
+# musl, OpenSSL linked in) for amd64 and arm64, checked by test/server/run.sh
+# against a client of the same tree, its SHA-256 alongside.
+on:
+  push:
+    branches:
+      - "server/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    name: Static server (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Static server (Alpine, musl, OpenSSL linked in)
+        run: docker run --rm -v "$PWD":/src -w /src alpine:3.20 sh .github/scripts/server-static.sh build-static
+
+      - name: A client for the checks
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev ninja-build meson
+          meson setup --buildtype=release --warnlevel=0 build
+          ninja -C build slipstream-client
+
+      - name: The checks against the static server
+        run: SLIPSTREAM_SERVER=build-static/slipstream-server test/server/run.sh build
+
+      - name: SHA-256
+        run: |
+          cp build-static/slipstream-server "slipstream-server-linux-${{ matrix.arch }}"
+          sha256sum "slipstream-server-linux-${{ matrix.arch }}" | tee "slipstream-server-linux-${{ matrix.arch }}.sha256"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: slipstream-server-linux-${{ matrix.arch }}
+          path: slipstream-server-linux-${{ matrix.arch }}*
