@@ -22,10 +22,12 @@
 #include "lua-resty-base-encoding-base32.h"
 #include "picoquic_config.h"
 #include "slipstream.h"
+#include "slipstream_dnsauth.h"
 #include "slipstream_inline_dots.h"
 #include "slipstream_pin.h"
 #include "slipstream_utils.h"
 #include "SPCDNS/src/dns.h"
+#include <openssl/rand.h>
 #include "SPCDNS/src/mappings.h"
 
 volatile sig_atomic_t should_shutdown = 0;
@@ -70,9 +72,32 @@ typedef struct st_slipstream_client_ctx_t {
 
 char* client_domain_name = NULL;
 size_t client_domain_name_len = 0;
+/* dnsauth-v2: the field in front of each packet (the network thread only reads these once set) */
+static bool client_dnsauth = false;
+static slipstream_client_dnsauth_t client_dnsauth_conf;
 
 ssize_t client_encode_segment(dns_packet_t* packet, size_t* packet_len, const unsigned char* src_buf, size_t src_buf_len) {
     char name[255];
+    unsigned char tagged[SLIPSTREAM_DNSAUTH_LEN + 255];
+    if (client_dnsauth) {
+        /* hint || tag over the packet, then the packet: the node's front checks and strips the field */
+        if (src_buf_len > sizeof(tagged) - SLIPSTREAM_DNSAUTH_LEN) {
+            return -1;
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        uint32_t epoch = slipstream_dnsauth_epoch((int64_t)now.tv_sec + client_dnsauth_conf.clock_offset);
+        slipstream_dnsauth_field(client_dnsauth_conf.key, epoch, src_buf, src_buf_len, tagged);
+        memcpy(tagged + SLIPSTREAM_DNSAUTH_LEN, src_buf, src_buf_len);
+        src_buf = tagged;
+        src_buf_len += SLIPSTREAM_DNSAUTH_LEN;
+    }
+    /* base32 grows 8/5, a dot every 57: the name and the zone must fit in a DNS name */
+    const size_t b32_len = (src_buf_len * 8 + 4) / 5;
+    if (b32_len + (b32_len > 0 ? (b32_len - 1) / 57 : 0) + 1 + client_domain_name_len + 2 > sizeof(name)) {
+        DBG_PRINTF("a packet of %zu bytes does not fit in a name under the zone\n", src_buf_len);
+        return -1;
+    }
     const size_t len = b32_encode(&name[0], (const char*) src_buf, src_buf_len, true, false);
     const size_t encoded_len = slipstream_inline_dotify(name, 255, len);
     name[encoded_len] = '.';
@@ -94,7 +119,12 @@ ssize_t client_encode_segment(dns_packet_t* packet, size_t* packet_len, const un
     edns.opt.udp_payload = 1232;
 
     dns_query_t query = {0};
-    query.id = rand() % UINT16_MAX;
+    /* unpredictable, and not the same run in every client as an unseeded rand() gives */
+    uint16_t id = 0;
+    if (RAND_bytes((unsigned char*)&id, sizeof(id)) != 1) {
+        return -1;
+    }
+    query.id = id;
     query.query = true;
     query.opcode = OP_QUERY;
     query.rd = true;
@@ -805,7 +835,8 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
 
 int picoquic_slipstream_client(const char* listen_host, int listen_port, struct st_address_t* server_addresses,
                                size_t server_address_count, const char* domain_name, const char* cc_algo_id, bool gso,
-                               const size_t keep_alive_interval, const slipstream_client_tls_t* tls) {
+                               const size_t keep_alive_interval, const slipstream_client_tls_t* tls,
+                               const slipstream_client_dnsauth_t* dnsauth) {
     /* Start: start the QUIC process */
     int ret = 0;
     uint64_t current_time = 0;
@@ -816,6 +847,12 @@ int picoquic_slipstream_client(const char* listen_host, int listen_port, struct 
     double mtu_d = 240 - (double) client_domain_name_len;
     mtu_d = mtu_d / 1.6;
     int mtu = (int) mtu_d;
+    if (dnsauth != NULL) {
+        /* the field takes 8 of the bytes a name holds */
+        client_dnsauth_conf = *dnsauth;
+        client_dnsauth = true;
+        mtu -= SLIPSTREAM_DNSAUTH_LEN;
+    }
 
     /* Create config */
     picoquic_quic_config_t config;

@@ -31,16 +31,21 @@ jobs:
           meson setup -Db_lto=true --buildtype=release --warnlevel=0 -Ddefault_library=static meson-build-release
           ninja -C meson-build-release
 
-      - name: The pin code without warnings
+      - name: The pin and dnsauth code without warnings
         working-directory: meson-build-release
         run: |
-          command=$(jq -r '.[] | select(.file | endswith("slipstream_pin.c")) | .command' compile_commands.json)
-          test -n "$command"
-          # only this file's own lines: the headers of picoquic and picotls are not ours
-          eval "$command -Wall -Wextra -fsyntax-only" 2>&1 | tee warnings.txt
-          ! grep -E "slipstream_pin\.c:[0-9]+:[0-9]+: (warning|error)" warnings.txt
+          for file in slipstream_pin.c slipstream_dnsauth.c; do
+            command=$(jq -r --arg f "$file" '[.[] | select(.file | endswith($f))][0].command' compile_commands.json)
+            test -n "$command" && test "$command" != null
+            # only this file's own lines: the headers of picoquic and picotls are not ours
+            eval "$command -Wall -Wextra -fsyntax-only" 2>&1 | tee "warnings-$file.txt"
+            ! grep -E "${file//./\\.}:[0-9]+:[0-9]+: (warning|error)" "warnings-$file.txt"
+          done
 
-      - name: The pin and the streams on the loopback
+      - name: dnsauth-v2 vectors
+        run: meson test -C meson-build-release --print-errorlogs
+
+      - name: The pin, dnsauth-v2 and the streams on the loopback
         run: python3 .github/scripts/client_pin_test.py meson-build-release
 
   android:

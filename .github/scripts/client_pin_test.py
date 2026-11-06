@@ -4,10 +4,14 @@
 TLS: the pinned key carries the request whatever the SNI says, another key and a client without --pin (and without
 --insecure) carry nothing, the client listens on the loopback only. Streams through the pinned client: one after
 another and side by side, a request ended by a half-close still gets its answer, and a large upload and download
-arrive whole. Usage: client_pin_test.py <the meson build directory>."""
+arrive whole. dnsauth-v2: through a front that checks the field on every query and passes the packet on without it,
+the device's key carries the request, another key or another clock does not. Usage: client_pin_test.py <the meson
+build directory>."""
 import base64
 import hashlib
+import hmac
 import os
+import struct
 import socket
 import subprocess
 import sys
@@ -33,6 +37,82 @@ def cert(name):
     der = subprocess.run(["openssl", "pkey", "-pubin", "-outform", "der"], input=pub, check=True,
                          capture_output=True).stdout
     return key, crt, base64.urlsafe_b64encode(hashlib.sha256(der).digest()).rstrip(b"=").decode()
+
+
+# dnsauth-v2's vector key (raycontrol docs/spec/dnsauth-v2.md §6)
+DNSAUTH_KEY = "0b485b425e8b19e0ec7c0362d55fdc34338147f984b87ee005455c8f5fc68b1c"
+
+
+def dnsauth_field(key, epoch, msg):
+    """hint (2) || tag (6), as the spec has it"""
+    e = struct.pack(">I", epoch)
+    return (hmac.new(key, b"dnsauth2-hint" + e, hashlib.sha256).digest()[:2] +
+            hmac.new(key, b"dnsauth2-tag" + e + msg, hashlib.sha256).digest()[:6])
+
+
+assert dnsauth_field(bytes.fromhex(DNSAUTH_KEY), 2945448, bytes(range(24))).hex() == "2d82b1220002a927"
+
+
+def strip_field(query, key):
+    """the query to pass on without its dnsauth-v2 field, or None when the field is not the key's"""
+    labels, off = [], 12
+    while query[off] != 0:
+        n = query[off]
+        if n & 0xC0:
+            return None
+        labels.append(query[off + 1:off + 1 + n])
+        off += 1 + n
+    end = off + 1
+    zone = DOMAIN.encode().split(b".")
+    if [label.lower() for label in labels[-len(zone):]] != zone or len(labels) <= len(zone):
+        return None
+    text = b"".join(labels[:-len(zone)]).upper()
+    try:
+        data = base64.b32decode(text + b"=" * (-len(text) % 8))
+    except ValueError:
+        return None
+    field, packet = data[:8], data[8:]
+    epoch = int(time.time()) // 600
+    if len(field) < 8 or not any(hmac.compare_digest(field, dnsauth_field(key, e, packet))
+                                 for e in (epoch - 1, epoch, epoch + 1)):
+        return None
+    text = base64.b32encode(packet).rstrip(b"=")
+    parts = [text[i:i + 57] for i in range(0, len(text), 57)] + zone
+    return query[:12] + b"".join(bytes([len(p)]) + p for p in parts) + b"\0" + query[end:]
+
+
+def front(port, key_hex):
+    """the node's front, as much as dnsauth-v2 needs: a query passes to the server only with the key's field, and
+    without it; the server's answer goes back as it is"""
+    key = bytes.fromhex(key_hex)
+    counters = {"passed": 0, "refused": 0}
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", port))
+    up = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    up.connect(("127.0.0.1", DNS_PORT))
+    clients = {}
+
+    def answers():
+        while True:
+            answer = up.recv(4096)
+            addr = clients.get(answer[:2])
+            if addr is not None:
+                sock.sendto(answer, addr)
+
+    def queries():
+        while True:
+            query, addr = sock.recvfrom(4096)
+            passed = strip_field(query, key)
+            if passed is None:
+                counters["refused"] += 1
+                continue
+            counters["passed"] += 1
+            clients[query[:2]] = addr
+            up.send(passed)
+
+    threading.Thread(target=answers, daemon=True).start()
+    threading.Thread(target=queries, daemon=True).start()
+    return counters
 
 
 def pattern(n):
@@ -64,9 +144,10 @@ def target():
         threading.Thread(target=answer, args=(conn,), daemon=True).start()
 
 
-def start(name, args):
+def start(name, args, env=None):
     log = open(os.path.join(WORK, name + ".log"), "wb")
-    proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT,
+                            env=None if env is None else {**os.environ, **env})
     procs.append((name, proc))
     return proc
 
@@ -106,15 +187,15 @@ def check(name, got, want):
         failures.append("%s: %r, want %r" % (name, shown, want if len(want) <= 80 else b"%d bytes" % len(want)))
 
 
-def client(name, port, *extra):
+def client(name, port, *extra, resolver=DNS_PORT, env=None):
     return start(name, [CLIENT, "--congestion-control=bbr", "--tcp-listen-port=%d" % port,
-                        "--resolver=127.0.0.1:%d" % DNS_PORT, "--domain=" + DOMAIN, *extra])
+                        "--resolver=127.0.0.1:%d" % resolver, "--domain=" + DOMAIN, *extra], env)
 
 
-def refused_at_start(name, *extra):
+def refused_at_start(name, *extra, env=None):
     """a client that must not start: exit code and what it says"""
     run = subprocess.run([CLIENT, "--resolver=127.0.0.1:%d" % DNS_PORT, "--domain=" + DOMAIN, "--tcp-listen-port=7999",
-                          *extra], capture_output=True, timeout=20)
+                          *extra], capture_output=True, timeout=20, env=None if env is None else {**os.environ, **env})
     if run.returncode == 0:
         sys.exit("%s: the client started (%s)" % (name, run.stdout.decode(errors="replace")))
     print("%s: refused, %s" % (name, (run.stderr or run.stdout).decode(errors="replace").strip()))
@@ -135,6 +216,9 @@ try:
     refused_at_start("a short pin", "--pin=" + pin[:20])
     refused_at_start("not base64url", "--pin=" + "!" * 43)
     refused_at_start("not an IPv4 listen address", "--pin=" + pin, "--tcp-listen-host=localhost")
+    refused_at_start("--dnsauth without its key", "--pin=" + pin, "--dnsauth")
+    refused_at_start("a short dnsauth key", "--pin=" + pin, "--dnsauth", env={"SLIPSTREAM_DNSAUTH_KEY": "0b48"})
+    refused_at_start("a dnsauth key without --dnsauth", "--pin=" + pin, env={"SLIPSTREAM_DNSAUTH_KEY": DNSAUTH_KEY})
 
     # the pin decides, the name is a cover: any SNI
     client("pinned", 7001, "--pin=" + pin, "--sni=cdn.example.net")
@@ -194,6 +278,28 @@ try:
     check("a download", exchange(7001, b"download %d\n" % (1024 * 1024), False, 180), pattern(1024 * 1024))
     print("  %.1f s" % (time.monotonic() - started))
     check("after them", exchange(7001, b"hello again\n", False, 30), b"answer to hello again\n")
+
+    # dnsauth-v2 through a front: the device's key passes, another key and a clock an hour off do not
+    tagged_front = front(8854, DNSAUTH_KEY)
+    other_front = front(8855, DNSAUTH_KEY)
+    clock_front = front(8856, DNSAUTH_KEY)
+    client("tagged", 7004, "--pin=" + pin, "--dnsauth", resolver=8854, env={"SLIPSTREAM_DNSAUTH_KEY": DNSAUTH_KEY})
+    client("tagged, another key", 7005, "--pin=" + pin, "--dnsauth", resolver=8855,
+           env={"SLIPSTREAM_DNSAUTH_KEY": "11" * 32})
+    client("tagged, another clock", 7006, "--pin=" + pin, "--dnsauth", "--clock-offset=3600", resolver=8856,
+           env={"SLIPSTREAM_DNSAUTH_KEY": DNSAUTH_KEY})
+    check("tagged", ask(7004, time.monotonic() + 60), b"answer to hello\n")
+    upload = pattern(256 * 1024)
+    check("tagged, an upload", exchange(7004, b"upload\n" + upload, True, 180),
+          b"got %d %s\n" % (len(upload), hashlib.sha256(upload).hexdigest().encode()))
+    check("tagged, another key", ask(7005, time.monotonic() + 20), b"")
+    check("tagged, another clock", ask(7006, time.monotonic() + 20), b"")
+    print("fronts: the key %s, another key %s, another clock %s" % (tagged_front, other_front, clock_front))
+    if tagged_front["passed"] == 0 or tagged_front["refused"] != 0:
+        failures.append("the key's front: %s, want every query passed" % tagged_front)
+    for name, counters in (("another key", other_front), ("another clock", clock_front)):
+        if counters["passed"] != 0 or counters["refused"] == 0:
+            failures.append("%s: the front %s, want every query refused" % (name, counters))
 finally:
     for name, proc in procs:
         proc.terminate()

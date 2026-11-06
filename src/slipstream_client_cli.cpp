@@ -1,8 +1,12 @@
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
 #include <picosocks.h>
 #include "slipstream.h"
+#include "slipstream_dnsauth.h"
+#include <openssl/crypto.h>
 #include "quick_arg_parser.hpp"
 
 struct ClientArgs : MainArguments<ClientArgs> {
@@ -19,6 +23,8 @@ struct ClientArgs : MainArguments<ClientArgs> {
     std::string sni = option("sni", '\0', "The server name the TLS ClientHello carries (default: " SLIPSTREAM_SNI ")") = SLIPSTREAM_SNI;
     std::string pin = option("pin", '\0', "The server's public key: base64url SHA-256 of its SubjectPublicKeyInfo (Required unless --insecure)");
     bool insecure = option("insecure", '\0', "Take any certificate the server shows (no --pin): the tunnel is open to whoever answers");
+    bool dnsauth = option("dnsauth", '\0', "dnsauth-v2 on every query with the device's key from SLIPSTREAM_DNSAUTH_KEY (64 hex)");
+    int clock_offset = option("clock-offset", '\0', "With --dnsauth: the node's clock less this one, in seconds (default: 0)") = 0;
 
     static std::string help(const std::string& program_name) {
         return "slipstream-client - A high-performance covert channel over DNS (client)\n\n" 
@@ -129,6 +135,25 @@ int main(int argc, char** argv) {
         exit(1);
     }
 
+    /* the key from the environment, not the arguments (which other processes may read), then gone from it */
+    slipstream_client_dnsauth_t dnsauth_conf;
+    memset(&dnsauth_conf, 0, sizeof(dnsauth_conf));
+    const char* dnsauth_key = getenv("SLIPSTREAM_DNSAUTH_KEY");
+    if (args.dnsauth) {
+        if (slipstream_dnsauth_parse_key(dnsauth_key, dnsauth_conf.key) != 0) {
+            std::cerr << "Client error: --dnsauth needs SLIPSTREAM_DNSAUTH_KEY, 64 hex digits" << std::endl;
+            exit(1);
+        }
+        dnsauth_conf.clock_offset = args.clock_offset;
+    } else if (dnsauth_key != NULL) {
+        std::cerr << "Client error: SLIPSTREAM_DNSAUTH_KEY without --dnsauth" << std::endl;
+        exit(1);
+    }
+    if (dnsauth_key != NULL) {
+        OPENSSL_cleanse((void*)dnsauth_key, strlen(dnsauth_key));
+        unsetenv("SLIPSTREAM_DNSAUTH_KEY");
+    }
+
     slipstream_client_tls_t tls;
     tls.alpn = args.alpn.c_str();
     tls.sni = args.sni.c_str();
@@ -143,8 +168,10 @@ int main(int argc, char** argv) {
         (char*)args.congestion_control.c_str(),
         args.gso,
         args.keep_alive_interval,
-        &tls
+        &tls,
+        args.dnsauth ? &dnsauth_conf : NULL
     );
+    OPENSSL_cleanse(&dnsauth_conf, sizeof(dnsauth_conf));
 
 #ifdef _WINDOWS
     WSACleanup();

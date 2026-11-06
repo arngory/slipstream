@@ -40,6 +40,7 @@ add_executable(slipstream-client
     ${SRC}/slipstream_client.c
     ${SRC}/slipstream_client_cli.cpp
     ${SRC}/slipstream_pin.c
+    ${SRC}/slipstream_dnsauth.c
     ${SRC}/slipstream_sockloop.c
     ${SRC}/slipstream_utils.c
     ${SRC}/slipstream_inline_dots.c

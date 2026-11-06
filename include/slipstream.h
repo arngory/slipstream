@@ -34,9 +34,18 @@ typedef struct st_slipstream_client_tls_t {
 #define SLIPSTREAM_CLIENT_EXIT_HANDSHAKE 2
 #define SLIPSTREAM_CLIENT_EXIT_PIN 3
 
+/* dnsauth-v2 on every query (slipstream_dnsauth.h): the device's key for the slipstream service and the node's clock
+ * less the client's, in seconds (the subscription's time field) */
+typedef struct st_slipstream_client_dnsauth_t {
+    uint8_t key[32];
+    int64_t clock_offset;
+} slipstream_client_dnsauth_t;
+
+/* dnsauth NULL: queries without the field */
 int picoquic_slipstream_client(const char* listen_host, int listen_port, struct st_address_t* server_addresses,
                                size_t server_address_count, const char* domain_name, const char* cc_algo_id, bool gso,
-                               size_t keep_alive_interval, const slipstream_client_tls_t* tls);
+                               size_t keep_alive_interval, const slipstream_client_tls_t* tls,
+                               const slipstream_client_dnsauth_t* dnsauth);
 
 int picoquic_slipstream_server(int server_port, bool listen_ipv6, const struct sockaddr_storage* listen_address,
                                const char* pem_cert, const char* pem_key,

@@ -51,6 +51,11 @@ $ openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der \
 `--sni` set what the TLS ClientHello carries (defaults: `picoquic_sample`, `test.example.com`); the client listens on
 `--tcp-listen-host` (default `127.0.0.1`). The TLS keys are not logged.
 
+`--dnsauth` puts dnsauth-v2 (raycontrol's `docs/spec/dnsauth-v2.md`) in front of the packet in every query: the
+device's key for the service comes from the environment, `SLIPSTREAM_DNSAUTH_KEY` (64 hex digits; not an argument,
+which other processes may read), and `--clock-offset` moves the clock its epoch is counted on (the node's time less
+this one, in seconds). The node's front checks the field and passes the packet on without it.
+
 The client exits with 1 on bad arguments, 2 when the handshake fails (the server does not answer, or refuses), and
 3 when the server's key is not the pinned one.
 
