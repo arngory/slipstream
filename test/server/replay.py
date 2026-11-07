@@ -9,7 +9,7 @@ A copy must get an empty answer: the server already had its packet, and the
 connection's next packet belongs to the client. STATUS_FILE gets
 "copies N with-data M" as they come.
 """
-import socket, struct, sys, threading
+import os, socket, struct, sys, threading
 port, server_port, status = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 server = ('127.0.0.1', server_port)
 front = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -59,8 +59,11 @@ def copy_answers():
             with_data += 1
             with open(status + '.data', 'a') as f:
                 f.write(question(m)[:80].hex() + '\n')
-        with open(status, 'w') as f:
+        # Whole or not at all: open(status, 'w') empties the file first, and
+        # run.sh reading it then found nothing (CI).
+        with open(status + '.tmp', 'w') as f:
             f.write(f'copies {copies} with-data {with_data}\n')
+        os.replace(status + '.tmp', status)
 
 
 threading.Thread(target=answers, daemon=True).start()
