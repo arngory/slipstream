@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""This branch's client against the hardened server (server/hardening): the dnsauth-v2 field the server takes off
+"""This branch's client against the hardened server (its release, as raycontrol ships it): the dnsauth-v2 field the server takes off
 (--tag-len 8, the node's front has checked it), the server's ALPN required, streams whole both ways, a half-close's
 answer; another ALPN fails the handshake (exit 2), a client without the field gets nothing through.
-Usage: server_interop.py <the client's build directory> <the server's build directory>."""
+Usage: server_interop.py <the client's build directory> <the directory of the server binary>."""
 import base64
 import hashlib
 import os
