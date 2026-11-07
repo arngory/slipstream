@@ -47,6 +47,9 @@ typedef struct st_slipstream_server_config_t {
     uint32_t max_streams;      /* bidirectional streams per connection */
     size_t max_pending;        /* bytes queued towards the target, all streams */
     size_t tag_len;            /* bytes the front checked before the QUIC packet */
+    /* A device's connections at once, by the device the front names (IPC
+     * version 2); 0: no limit. */
+    uint32_t max_device_connections;
 } slipstream_server_config_t;
 
 int picoquic_slipstream_server(const slipstream_server_config_t* config);

@@ -55,9 +55,13 @@ static size_t server_tag_len = 0;
 /* IPC with a DNS front (niko-server "packet" mode, docs/server-front.md):
  * one SOCK_SEQPACKET message per query and per answer,
  *   "NU" | 1 | client (19) | local (19) | DNS message
- * The addresses go back as they came: the front answers that query. */
+ * or, from a front that names the query's device (niko-server v0.14.0),
+ *   "NU" | 2 | client (19) | local (19) | device (8) | DNS message
+ * The addresses go back as they came, in version 1: the front answers that
+ * query. */
 #define FRONT_ADDRS_LEN (2 * 19)
 #define FRONT_HEADER_LEN (3 + FRONT_ADDRS_LEN)
+#define FRONT_DEVICE_LEN 8
 /* The front forwards queries up to this size; SPCDNS decodes into 4 KiB. */
 #define SERVER_MAX_QUERY 4096
 
@@ -66,6 +70,8 @@ typedef struct st_server_slot_t {
     bool answer; /* an answer goes back for this query */
     uint64_t unique_path_id; /* the path the query came on: indexes move when paths go */
     uint8_t front_addrs[FRONT_ADDRS_LEN];
+    bool has_device; /* the front named the query's device (IPC version 2) */
+    uint64_t device;
 } server_slot_t;
 
 /* The answer mirrors the query's EDNS: an OPT only when the query had one,
@@ -363,6 +369,8 @@ ssize_t server_decode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
 static size_t slipstream_pending_total = 0;
 static size_t slipstream_pending_max = 64 * 1024 * 1024;
 static size_t slipstream_max_connections = 64;
+static size_t slipstream_max_device_connections = 0; /* 0: no limit */
+static uint64_t slipstream_device_evict_us = 30000000; /* a device's connection silent this long gives way */
 #define SLIPSTREAM_WRITE_BUDGET (64 * 1024)
 #define SLIPSTREAM_CONNECT_TIMEOUT_US (30ULL * 1000000)
 
@@ -397,6 +405,10 @@ typedef struct st_slipstream_server_ctx_t {
     slipstream_server_stream_ctx_t* first_stream;
     struct sockaddr_storage upstream_addr;
     size_t pending_bytes; /* queued towards the target, all this connection's streams */
+    /* The device of the first packet taken for the connection, as the
+     * front named it (--max-connections-per-device). */
+    bool has_device;
+    uint64_t device;
     struct st_slipstream_server_ctx_t* prev_ctx;
     struct st_slipstream_server_ctx_t* next_ctx;
     /* Only the default context owns the reusable poll arrays. */
@@ -797,28 +809,93 @@ static void slipstream_server_reap(picoquic_quic_t* quic) {
 
 int slipstream_server_callback(picoquic_cnx_t* cnx,
                                uint64_t stream_id, uint8_t* bytes, size_t length,
-                               picoquic_call_back_event_t fin_or_event, void* callback_ctx, void* v_stream_ctx) {
-    slipstream_server_ctx_t* server_ctx = callback_ctx;
-    slipstream_server_stream_ctx_t* stream_ctx = v_stream_ctx;
+                               picoquic_call_back_event_t fin_or_event, void* callback_ctx, void* v_stream_ctx);
+
+/* server_ctx_of is the connection's own context, made at its first use (a
+ * callback, or the first packet taken for it). NULL without memory, the
+ * connection closed. */
+static slipstream_server_ctx_t* server_ctx_of(picoquic_cnx_t* cnx, slipstream_server_ctx_t* server_ctx) {
     slipstream_server_ctx_t* default_ctx = picoquic_get_default_callback_context(picoquic_get_quic_ctx(cnx));
-    if (server_ctx == NULL || server_ctx == default_ctx) {
-        if (default_ctx == NULL) {
-            return -1;
+    if (server_ctx != NULL && server_ctx != default_ctx) {
+        return server_ctx;
+    }
+    if (default_ctx == NULL) {
+        return NULL;
+    }
+    server_ctx = calloc(1, sizeof(*server_ctx));
+    if (server_ctx == NULL) {
+        picoquic_close(cnx, PICOQUIC_ERROR_MEMORY);
+        return NULL;
+    }
+    server_ctx->upstream_addr = default_ctx->upstream_addr;
+    server_ctx->cnx = cnx;
+    server_ctx->next_ctx = default_ctx->next_ctx;
+    server_ctx->prev_ctx = default_ctx;
+    if (server_ctx->next_ctx != NULL) {
+        server_ctx->next_ctx->prev_ctx = server_ctx;
+    }
+    default_ctx->next_ctx = server_ctx;
+    picoquic_set_callback(cnx, slipstream_server_callback, server_ctx);
+    return server_ctx;
+}
+
+/* server_device_admit gives a connection the device of the first packet
+ * picoquic took for it (the front names it, IPC version 2), within
+ * --max-connections-per-device: one device's key cannot take every
+ * connection of the server (slipstream-v1 §3). Over the limit, the device's
+ * connection silent longest goes when it has been silent
+ * slipstream_device_evict_us (a phone on a new network leaves the old one
+ * behind), else the new one does: false, and it is closed. Not before
+ * every packet: a connection keeps the device it started with. */
+static bool server_device_admit(picoquic_cnx_t* cnx, uint64_t device, uint64_t now) {
+    slipstream_server_ctx_t* ctx = server_ctx_of(cnx, picoquic_get_callback_context(cnx));
+    if (ctx == NULL) {
+        return false;
+    }
+    if (ctx->has_device || slipstream_max_device_connections == 0) {
+        if (!ctx->has_device) {
+            ctx->has_device = true;
+            ctx->device = device;
         }
-        server_ctx = calloc(1, sizeof(*server_ctx));
-        if (server_ctx == NULL) {
-            picoquic_close(cnx, PICOQUIC_ERROR_MEMORY);
-            return -1;
+        return true;
+    }
+    slipstream_server_ctx_t* default_ctx = picoquic_get_default_callback_context(picoquic_get_quic_ctx(cnx));
+    size_t count = 0;
+    slipstream_server_ctx_t* silent = NULL;
+    for (slipstream_server_ctx_t* other = default_ctx->next_ctx; other != NULL; other = other->next_ctx) {
+        if (other == ctx || !other->has_device || other->device != device || other->cnx == NULL ||
+            other->cnx->cnx_state >= picoquic_state_disconnecting) {
+            continue;
         }
-        server_ctx->upstream_addr = default_ctx->upstream_addr;
-        server_ctx->cnx = cnx;
-        server_ctx->next_ctx = default_ctx->next_ctx;
-        server_ctx->prev_ctx = default_ctx;
-        if (server_ctx->next_ctx != NULL) {
-            server_ctx->next_ctx->prev_ctx = server_ctx;
+        count++;
+        if (silent == NULL || other->cnx->latest_receive_time < silent->cnx->latest_receive_time) {
+            silent = other;
         }
-        default_ctx->next_ctx = server_ctx;
-        picoquic_set_callback(cnx, slipstream_server_callback, server_ctx);
+    }
+    if (count >= slipstream_max_device_connections) {
+        if (silent == NULL || now < silent->cnx->latest_receive_time ||
+            now - silent->cnx->latest_receive_time < slipstream_device_evict_us) {
+            return false;
+        }
+        /* Silent that long, no query of this batch is bound to it (a slot
+         * binds a connection that took its packet now). The reaper deletes
+         * it; its callback frees its context. */
+        fprintf(stderr, "A device's connection silent %llu s gives way to its new one (--max-connections-per-device %zu)\n",
+            (unsigned long long)((now - silent->cnx->latest_receive_time) / 1000000), slipstream_max_device_connections);
+        picoquic_connection_disconnect(silent->cnx);
+    }
+    ctx->has_device = true;
+    ctx->device = device;
+    return true;
+}
+
+int slipstream_server_callback(picoquic_cnx_t* cnx,
+                               uint64_t stream_id, uint8_t* bytes, size_t length,
+                               picoquic_call_back_event_t fin_or_event, void* callback_ctx, void* v_stream_ctx) {
+    slipstream_server_stream_ctx_t* stream_ctx = v_stream_ctx;
+    slipstream_server_ctx_t* server_ctx = server_ctx_of(cnx, callback_ctx);
+    if (server_ctx == NULL) {
+        return -1;
     }
 
     switch (fin_or_event) {
@@ -1052,7 +1129,7 @@ static int server_receive(server_io_t* io, uint8_t* buffer, size_t size, size_t*
         return 0;
     }
     if (io->front_fd >= 0) {
-        uint8_t message[FRONT_HEADER_LEN + SERVER_MAX_QUERY];
+        uint8_t message[FRONT_HEADER_LEN + FRONT_DEVICE_LEN + SERVER_MAX_QUERY];
         ssize_t n = recv(io->front_fd, message, sizeof(message), MSG_DONTWAIT | MSG_TRUNC);
         if (n < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -1065,14 +1142,24 @@ static int server_receive(server_io_t* io, uint8_t* buffer, size_t size, size_t*
             return 0;
         }
         /* MSG_TRUNC gives the full length: a longer message was cut. */
-        if ((size_t)n > sizeof(message) || (size_t)n <= FRONT_HEADER_LEN ||
-            message[0] != 'N' || message[1] != 'U' || message[2] != 1 || (size_t)n - FRONT_HEADER_LEN > size) {
+        const size_t header = (n >= 3 && message[2] == 2) ? FRONT_HEADER_LEN + FRONT_DEVICE_LEN : FRONT_HEADER_LEN;
+        if ((size_t)n > sizeof(message) || (size_t)n <= header ||
+            message[0] != 'N' || message[1] != 'U' || (message[2] != 1 && message[2] != 2) ||
+            (size_t)n - header > size) {
             *length = 0;
             return 1;
         }
         memcpy(slot->front_addrs, message + 3, FRONT_ADDRS_LEN);
-        *length = (size_t)n - FRONT_HEADER_LEN;
-        memcpy(buffer, message + FRONT_HEADER_LEN, *length);
+        if (message[2] == 2) {
+            uint64_t device = 0;
+            for (size_t i = 0; i < FRONT_DEVICE_LEN; i++) {
+                device = device << 8 | message[FRONT_HEADER_LEN + i];
+            }
+            slot->has_device = true;
+            slot->device = device;
+        }
+        *length = (size_t)n - header;
+        memcpy(buffer, message + header, *length);
         /* QUIC sees a dummy address either way (server_decode). */
         ((struct sockaddr_in*)peer)->sin_family = AF_INET;
         ((struct sockaddr_in*)local)->sin_family = AF_INET;
@@ -1380,6 +1467,13 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
             if (ret != 0 || last_cnx == NULL || last_cnx->latest_receive_time != receive_time) {
                 continue; /* answered empty */
             }
+            if (slot->has_device && !server_device_admit(last_cnx, slot->device, receive_time)) {
+                /* The device has its connections: the new one goes, and
+                 * the reaper deletes it. Answered empty; a retry of the
+                 * same packet is no copy. */
+                picoquic_connection_disconnect(last_cnx);
+                continue;
+            }
             seen_take(packet_hash, receive_time);
             slot->s.cnx = last_cnx;
             slot->s.path_id = last_path_id;
@@ -1479,6 +1573,10 @@ int picoquic_slipstream_server(const slipstream_server_config_t* cfg) {
     server_tag_len = cfg->tag_len;
     slipstream_pending_max = cfg->max_pending;
     slipstream_max_connections = cfg->max_connections;
+    slipstream_max_device_connections = cfg->max_device_connections;
+    /* Within the idle timeout: a connection silent that long is gone
+     * anyway (30 s, or half of a shorter timeout). */
+    slipstream_device_evict_us = MIN((uint64_t)30000000, cfg->idle_timeout_ms * 500);
 
     /* The packets taken, for copies (4 MiB). */
     seen_packets.gens[0] = calloc(SEEN_SLOTS, sizeof(uint64_t));

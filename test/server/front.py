@@ -1,16 +1,24 @@
 """A stand-in for the DNS front (niko-server "packet" mode) in tests.
 
-front.py UDP_PORT SOCKET TAG_LEN DOMAIN: takes DNS queries on 127.0.0.1:UDP_PORT
-and hands them to slipstream-server --front-socket SOCKET with the IPC v1
-header. With TAG_LEN > 0 it puts that many random bytes before the QUIC
+front.py UDP_PORT SOCKET TAG_LEN DOMAIN [DEVICE]: takes DNS queries on
+127.0.0.1:UDP_PORT and hands them to slipstream-server --front-socket SOCKET
+with the IPC v1 header, or with DEVICE the v2 one naming that device (its
+first 8 bytes, as the front names a device whose tag it checked). Ports and
+devices may be lists (25320,25321 dev-a,dev-b): a port's queries are its
+device's (the server takes one front at a time). With TAG_LEN > 0 it puts that many random bytes before the QUIC
 packet in the name (as a client signing with dnsauth-v2 would), in place of
 a label that starts with "pppp" (give the client a domain such as
 pppppppppppppppp.<DOMAIN>, so that its names leave room), and gives the
 client back its own question.
 """
 import socket, struct, sys, os, base64, threading, select
-udp_port=int(sys.argv[1]); sock_path=sys.argv[2]; tag=int(sys.argv[3]); domain=sys.argv[4]
-u=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(('127.0.0.1',udp_port))
+ports=[int(p) for p in sys.argv[1].split(',')]; sock_path=sys.argv[2]; tag=int(sys.argv[3]); domain=sys.argv[4]
+devices=[d.encode()[:8].ljust(8, b'\0') for d in sys.argv[5].split(',')] if len(sys.argv) > 5 else [None]*len(ports)
+socks=[]
+for p in ports:
+    s_=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s_.bind(('127.0.0.1',p)); socks.append(s_)
+udp_port=ports[0]; u=socks[0]
+via={}  # client -> the socket its queries came in on, for its answers
 import time
 while True:
     try:
@@ -48,13 +56,18 @@ def back():
             k=(client,ans[:2].hex()); o=orig.pop(k,None)
             if o is None: continue
             e=qend(ans); ans=ans[:12]+o+ans[e:]
-        u.sendto(bytes(ans),client)
+        via.get(client, u).sendto(bytes(ans),client)
 threading.Thread(target=back,daemon=True).start()
 while True:
-    m,c=u.recvfrom(4096)
+    ready,_,_=select.select(socks,[],[])
+    us=ready[0]; device=devices[socks.index(us)]
+    m,c=us.recvfrom(4096); via[c]=us
     if tag:
         try:
             orig[(c,m[:2].hex())]=m[12:qend(m)]; m=retag(m)
         except Exception as ex:
             continue
-    b.send(b'NU\x01'+addr(c)+addr(local)+m)
+    if device is None:
+        b.send(b'NU\x01'+addr(c)+addr(local)+m)
+    else:
+        b.send(b'NU\x02'+addr(c)+addr(local)+device+m)

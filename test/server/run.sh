@@ -76,6 +76,41 @@ for tag in 0 8; do
   echo "ok: echo through the front, tag $tag"
 done
 
+# a device's connections at once (--max-connections-per-device 1, the front
+# names the device in IPC version 2): a second client of the same device
+# gets nothing while the first is busy, another device gets through; the
+# first silent past the eviction (half the idle timeout here), the second
+# takes its place before the timeout would have ended it.
+sock="$work/device.sock"
+server -f "$sock" -u "$(id -u)" -t 8 -i 12 --max-connections-per-device 1 >device.log 2>&1
+sleep 0.3
+python3 "$here/front.py" 25320,25321 "$sock" 8 t.example dev-a,dev-b & pids+=($!)
+sleep 0.3
+"$build/slipstream-client" -l 25420 -r 127.0.0.1:25320 -d pppppppppppppppp.t.example >device-a1.log 2>&1 &
+a1=$!; pids+=($a1)
+sleep 2
+echo_through 25420 || fail "echo of the device's first connection"
+"$build/slipstream-client" -l 25421 -r 127.0.0.1:25320 -d pppppppppppppppp.t.example >device-a2.log 2>&1 &
+a2=$!; pids+=($a2)
+"$build/slipstream-client" -l 25422 -r 127.0.0.1:25321 -d pppppppppppppppp.t.example >device-b.log 2>&1 & pids+=($!)
+sleep 3
+echo_through 25422 || fail "echo of another device beside it"
+if timeout 8 python3 -c "
+import socket, sys
+s = socket.create_connection(('127.0.0.1', 25421), timeout=6); s.sendall(b'x' * 1000)
+sys.exit(0 if s.recv(1000) else 1)" 2>/dev/null; then
+  fail "a second connection of the device got through"
+fi
+# Both of the device's clients go (the refused one would take the place
+# the moment the first is silent long enough).
+kill "$a1" "$a2"; wait "$a1" "$a2" 2>/dev/null || true
+sleep 7 # silent past the eviction (6 s), within the idle timeout (12 s)
+"$build/slipstream-client" -l 25423 -r 127.0.0.1:25320 -d pppppppppppppppp.t.example >device-a3.log 2>&1 & pids+=($!)
+sleep 3
+echo_through 25423 || fail "the device's new connection after its silent one"
+grep -q 'gives way to its new one' device.log || fail "no eviction logged: $(tail -3 device.log)"
+echo "ok: a device's connections at once, another device beside it, the silent one evicted"
+
 # a stranger on the front socket
 server -f "$work/uid.sock" -u 4242 >uid.log 2>&1
 sleep 0.3

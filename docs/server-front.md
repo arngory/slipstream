@@ -21,6 +21,7 @@ of a UDP socket, and is hardened for queries from anyone.
 | `--max-streams N` | streams at once per connection (default 64) |
 | `--max-pending-mib N` | bytes queued towards the target, all streams together (default 64 MiB) |
 | `--tag-len N` | bytes at the start of each query's data that the front checked (dnsauth-v2: 8) |
+| `--max-connections-per-device N` | connections at once of one device, as the front names it (IPC version 2): over it, the device's connection silent longest goes if silent 30 s (or half a shorter `--idle-timeout`), else the new one does (default 0: no limit; at most `--max-connections`) |
 
 ## IPC with the front
 
@@ -35,6 +36,18 @@ An address is family (4 or 6) | 16 bytes (IPv4 as `::ffff:a.b.c.d`) | port (big-
 addresses from a query into its answer: the front answers only a query that waits, within its requester's size. The
 socket is created with mode 0660; who reaches it is the directory's business, and the peer's UID is checked with
 `SO_PEERCRED`. One front at a time: a new connection replaces the old one.
+
+A front that checked the query's device tag (niko-server v0.14.0, `devices` on the backend) names the device in
+version 2, the answers staying in version 1:
+
+```
+"NU" | 2 | client (19) | local (19) | device (8) | DNS message
+```
+
+The device is a token of the front's (a hash of the device's ID), the same for all its queries. The first packet
+picoquic takes for a new connection gives the connection its device; `--max-connections-per-device` counts by it.
+Without it (version 1, or UDP) a connection has no device and no such limit: one device's key could otherwise take
+every connection of the server, the others' waiting out the idle timeout.
 
 ## What the server answers
 

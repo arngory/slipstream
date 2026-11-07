@@ -28,6 +28,7 @@ struct ServerArgs : MainArguments<ServerArgs> {
     long max_streams = option("max-streams", 's', "Streams at once per connection (default: 64)") = 64;
     long max_pending = option("max-pending-mib", 'p', "MiB queued towards the target, all streams together (default: 64)") = 64;
     long tag_len = option("tag-len", 't', "Bytes at the start of each query's data that the front checked (dnsauth-v2: 8; default: 0)") = 0;
+    long max_device_connections = option("max-connections-per-device", '\0', "Connections at once of one device, as the front names it (IPC version 2): over it, the device's connection silent longest goes, or the new one (default: 0, no limit)") = 0;
 
     static std::string help(const std::string& program_name) {
         return "slipstream-server - A high-performance covert channel over DNS (server)\n\n" 
@@ -93,9 +94,11 @@ int main(int argc, char** argv) {
         args.max_streams < 1 || args.max_streams > 4096 ||
         args.max_pending < 1 || args.max_pending > 4096 ||
         args.tag_len < 0 || args.tag_len > 64 ||
-        args.front_uid < -1 || args.front_uid > 0x7fffffffL) {
+        args.front_uid < -1 || args.front_uid > 0x7fffffffL ||
+        args.max_device_connections < 0 || args.max_device_connections > args.max_connections) {
         std::cerr << "Server error: --idle-timeout 5..3600, --max-connections and --max-streams 1..4096, "
-                     "--max-pending-mib 1..4096, --tag-len 0..64, --front-uid -1 or a UID" << std::endl;
+                     "--max-pending-mib 1..4096, --tag-len 0..64, --front-uid -1 or a UID, "
+                     "--max-connections-per-device 0..--max-connections" << std::endl;
         return 1;
     }
 
@@ -185,6 +188,7 @@ int main(int argc, char** argv) {
     config.max_streams = (uint32_t)args.max_streams;
     config.max_pending = (size_t)args.max_pending << 20;
     config.tag_len = (size_t)args.tag_len;
+    config.max_device_connections = (uint32_t)args.max_device_connections;
     exit_code = picoquic_slipstream_server(&config);
 
 #ifdef _WINDOWS
