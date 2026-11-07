@@ -224,6 +224,9 @@ try:
     client("pinned", 7001, "--pin=" + pin, "--sni=cdn.example.net")
     client("insecure", 7002, "--insecure")
     client("other key", 7003, "--pin=" + other_pin)
+    # a pin may start with "-" (one key in 64): given with "=", it is the pin, not options (the app passes it so);
+    # this one is not the server's, and the client says so with its own exit code, not the arguments' 1
+    client("a pin starting with -", 7008, "--pin=-" + other_pin[1:])
     time.sleep(2)
 
     listening = subprocess.run(["ss", "-ltnH"], capture_output=True, text=True).stdout
@@ -243,6 +246,13 @@ try:
         failures.append("other key: the client still runs")
     if other.returncode != 3:
         failures.append("other key: exit %s, want 3 (the server's key is not the pinned one)" % other.returncode)
+    dash = dict(procs)["a pin starting with -"]
+    try:
+        dash.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        failures.append("a pin starting with -: the client still runs")
+    if dash.returncode != 3:
+        failures.append("a pin starting with -: exit %s, want 3 (taken as the pin, not the server's)" % dash.returncode)
 
     # the streams through the pinned client, now connected
     for i in range(20):
@@ -283,11 +293,15 @@ try:
     tagged_front = front(8854, DNSAUTH_KEY)
     other_front = front(8855, DNSAUTH_KEY)
     clock_front = front(8856, DNSAUTH_KEY)
+    behind_front = front(8857, DNSAUTH_KEY)
     client("tagged", 7004, "--pin=" + pin, "--dnsauth", resolver=8854, env={"SLIPSTREAM_DNSAUTH_KEY": DNSAUTH_KEY})
     client("tagged, another key", 7005, "--pin=" + pin, "--dnsauth", resolver=8855,
            env={"SLIPSTREAM_DNSAUTH_KEY": "11" * 32})
     client("quiet", 7007, "--pin=" + pin, "--quiet")
     client("tagged, another clock", 7006, "--pin=" + pin, "--dnsauth", "--clock-offset=3600", resolver=8856,
+           env={"SLIPSTREAM_DNSAUTH_KEY": DNSAUTH_KEY})
+    # the node's clock behind this one: a negative offset (the app gives it with "=", as every value)
+    client("tagged, the clock behind", 7009, "--pin=" + pin, "--dnsauth", "--clock-offset=-3600", resolver=8857,
            env={"SLIPSTREAM_DNSAUTH_KEY": DNSAUTH_KEY})
     check("tagged", ask(7004, time.monotonic() + 60), b"answer to hello\n")
     upload = pattern(256 * 1024)
@@ -295,11 +309,16 @@ try:
           b"got %d %s\n" % (len(upload), hashlib.sha256(upload).hexdigest().encode()))
     check("tagged, another key", ask(7005, time.monotonic() + 20), b"")
     check("tagged, another clock", ask(7006, time.monotonic() + 20), b"")
+    check("tagged, the clock behind", ask(7009, time.monotonic() + 20), b"")
+    if dict(procs)["tagged, the clock behind"].poll() is not None:
+        failures.append("tagged, the clock behind: the client ended (%s): its offset not taken"
+                        % dict(procs)["tagged, the clock behind"].returncode)
     check("quiet", ask(7007, time.monotonic() + 60), b"answer to hello\n")
     print("fronts: the key %s, another key %s, another clock %s" % (tagged_front, other_front, clock_front))
     if tagged_front["passed"] == 0 or tagged_front["refused"] != 0:
         failures.append("the key's front: %s, want every query passed" % tagged_front)
-    for name, counters in (("another key", other_front), ("another clock", clock_front)):
+    for name, counters in (("another key", other_front), ("another clock", clock_front),
+                           ("the clock behind", behind_front)):
         if counters["passed"] != 0 or counters["refused"] == 0:
             failures.append("%s: the front %s, want every query refused" % (name, counters))
 finally:

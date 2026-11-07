@@ -47,6 +47,9 @@ $ openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der \
     | openssl dgst -sha256 -binary | basenc --base64url | tr -d '='
 ```
 
+Give values with `=` (`--pin=<pin>`, `--clock-offset=<seconds>`): a pin starts with `-` for about one key in 64, and
+the clock offset is negative when the node's clock is behind; as the next word, such a value is taken for options.
+
 `--insecure` takes any certificate instead (for tests: the tunnel is then open to whoever answers). `--alpn` and
 `--sni` set what the TLS ClientHello carries (defaults: `picoquic_sample`, `test.example.com`); the client listens on
 `--tcp-listen-host` (default `127.0.0.1`). The TLS keys are not logged.
