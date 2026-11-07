@@ -11,7 +11,14 @@ on:
     # (raycontrol pins them by SHA-256, deploy/versions.env there).
     tags:
       - "server-v*"
+  # Or by hand with the tag to make: the release (and its tag) at the run's
+  # commit.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to make, server-vX.Y.Z (empty: build only)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -58,7 +65,7 @@ jobs:
 
   release:
     name: Release
-    if: startsWith(github.ref, 'refs/tags/server-v')
+    if: startsWith(github.ref, 'refs/tags/server-v') || startsWith(inputs.tag, 'server-v')
     needs: server
     runs-on: ubuntu-24.04
     permissions:
@@ -81,8 +88,9 @@ jobs:
       - name: The release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          [[ $TAG =~ ^server-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a server tag: $TAG"; exit 1; }
           notes=(--notes "slipstream-server from ${GITHUB_SHA} (docs/server-front.md)")
           if [ -f "docs/server-releases/${TAG}.md" ]; then notes=(--notes-file "docs/server-releases/${TAG}.md"); fi
           gh release create "$TAG" --target "$GITHUB_SHA" --title "slipstream-server ${TAG#server-}" "${notes[@]}" \
