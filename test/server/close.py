@@ -1,11 +1,19 @@
-"""A connection that closes in its handshake (review of
---max-connections-per-device): as the DNS front (IPC version 2) for device
-dev-a, an Initial with the start of a ClientHello, then one with a
-CONNECTION_CLOSE; picoquic closes the connection at once and the reaper
-deletes it. Its device must hold no place after: a context made for the
-closed connection outlived it and locked the device out for good.
+"""Connections that hold no place (reviews of --max-connections-per-device).
+As the DNS front (IPC version 2) for device dev-a, COUNT connections that
+picoquic makes but that must not keep a place of the server's or the
+device's:
 
-close.py SOCKET DOMAIN, the server with --tag-len 8 (needs python3-cryptography)"""
+  close   an Initial with the start of a ClientHello, then one with a
+          CONNECTION_CLOSE: closed in the handshake (its context outlived it
+          and locked the device out for good);
+  fail    the same, then an Initial with a STREAM frame: the handshake
+          fails (held to the handshake's 10 s, uncounted);
+  orphan  a datagram of two Initials with different connection IDs:
+          picoquic makes the second's connection, then refuses the segment
+          (nothing took it; held 10 s).
+
+close.py SOCKET DOMAIN [MODE [COUNT]] (MODE close, fail, orphan or all;
+default close 1), the server with --tag-len 8 (needs python3-cryptography)"""
 import socket, struct, sys, os, time, base64
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 from cryptography.hazmat.primitives import hashes, hmac
@@ -22,10 +30,10 @@ def expand_label(secret, label, length):
 def keys(dcid):
     s = expand_label(extract(SALT, dcid), 'client in', 32)
     return expand_label(s, 'quic key', 16), expand_label(s, 'quic iv', 12), expand_label(s, 'quic hp', 16)
-def initial(dcid, scid, pn, payload):
+def initial(dcid, scid, pn, payload, pad=90):
     key, iv, hp = keys(dcid)
     pn_len = 4
-    payload = payload + b'\x00' * max(0, 90 - len(payload))  # PADDING
+    payload = payload + b'\x00' * max(0, pad - len(payload))  # PADDING
     length = pn_len + len(payload) + 16
     hdr = bytes([0xc0 | (pn_len - 1)]) + struct.pack('!I', 1) + bytes([len(dcid)]) + dcid + bytes([len(scid)]) + scid
     hdr += b'\x00' + struct.pack('!H', 0x4000 | length)
@@ -61,9 +69,23 @@ f = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET); f.connect(sock_path)
 def send(pkt):
     m = b'NU\x02' + addr(40000) + addr(53) + device + query(pkt, domain)
     f.send(m)
-dA, sA = os.urandom(8), os.urandom(8)
-send(initial(dA, sA, 0, crypto_frame(partial_client_hello())))
-time.sleep(0.3)
-send(initial(dA, sA, 1, b'\x1c\x00\x00\x00'))  # CONNECTION_CLOSE(no error, frame 0, no reason)
-time.sleep(2.5)  # the reaper deletes A (state disconnected)
+mode = sys.argv[3] if len(sys.argv) > 3 else 'close'
+count = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+kinds = ['close', 'fail', 'orphan'] if mode == 'all' else [mode]
+for m in kinds:
+    for _ in range(count):
+        d, sc = os.urandom(8), os.urandom(8)
+        if m == 'orphan':
+            send(initial(d, b'', 0, b'\x01', pad=4) + initial(os.urandom(8), b'', 0, b'\x01', pad=49))
+            continue
+        send(initial(d, sc, 0, crypto_frame(partial_client_hello())))
+        time.sleep(0.05)
+        if m == 'close':
+            send(initial(d, sc, 1, b'\x1c\x00\x00\x00'))  # CONNECTION_CLOSE(no error, frame 0, no reason)
+        elif m == 'fail':
+            send(initial(d, sc, 1, b'\x08\x00\x01x'))  # STREAM in an Initial: PROTOCOL_VIOLATION
+        else:
+            sys.exit('mode: close, fail, orphan or all')
+    time.sleep(0.05)
+time.sleep(0.5)
 print('sent')

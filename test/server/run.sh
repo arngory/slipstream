@@ -108,23 +108,50 @@ echo_through 25423 || fail "the device's client restarted at once"
 grep -q 'gives way to its new one' device.log || fail "no eviction logged: $(tail -3 device.log)"
 echo "ok: a device's connections at once, another device beside it, a restart gets in"
 
-# A connection that closes in its handshake holds no place (review: its
-# context outlived it and locked the device out for good).
+# Connections that hold no place: closed in the handshake (a context
+# outlived one and locked its device out for good), handshakes failed on
+# purpose, and connections picoquic makes for a datagram's other segment
+# (each held one of the server's places for 10 s: one device's key locked
+# every other device out; reviews). With -m 3, after dev-a's three of each,
+# dev-a and dev-b both get in at once.
 if python3 -c 'import cryptography' 2>/dev/null; then
   kill "$front_pid"; wait "$front_pid" 2>/dev/null || true
-  sock="$work/close.sock"
-  server -f "$sock" -u "$(id -u)" -t 8 -i 12 --max-connections-per-device 1 >close.log 2>&1
+  sock="$work/held.sock"
+  server -f "$sock" -u "$(id -u)" -t 8 -i 12 -m 3 --max-connections-per-device 1 >held.log 2>&1
   sleep 0.3
-  timeout 20 python3 "$here/close.py" "$sock" t.example >/dev/null || fail "close.py"
-  python3 "$here/front.py" 25330 "$sock" 8 t.example dev-a & pids+=($!)
+  timeout 20 python3 "$here/close.py" "$sock" t.example all 3 >/dev/null || fail "close.py"
+  python3 "$here/front.py" 25330,25331 "$sock" 8 t.example dev-a,dev-b & front_pid=$!; pids+=($front_pid)
   sleep 0.3
-  "$build/slipstream-client" -l 25430 -r 127.0.0.1:25330 -d pppppppppppppppp.t.example >close-client.log 2>&1 & pids+=($!)
+  "$build/slipstream-client" -l 25430 -r 127.0.0.1:25330 -d pppppppppppppppp.t.example >held-a.log 2>&1 & pids+=($!)
+  "$build/slipstream-client" -l 25431 -r 127.0.0.1:25331 -d pppppppppppppppp.t.example >held-b.log 2>&1 & pids+=($!)
   sleep 2
-  echo_through 25430 || fail "the device locked out after a connection closed in its handshake: $(tail -3 close.log)"
-  echo "ok: a connection closed in its handshake holds no place"
+  echo_through 25430 || fail "the device locked out by its connections that hold no place: $(tail -3 held.log)"
+  echo_through 25431 || fail "another device locked out by them: $(tail -3 held.log)"
+  echo "ok: connections closed or failed in the handshake, or never taken, hold no place"
 else
-  echo "skip: no python3 cryptography for the close in the handshake"
+  echo "skip: no python3 cryptography for connections that hold no place"
 fi
+
+# A full server (-m 2, both places taken): a device's client restarted at
+# once gets in when its old connection has been silent past the eviction
+# (review: picoquic refused it with SERVER_BUSY before the limits were
+# asked, and the client gave up; it waited out the idle timeout).
+kill "$front_pid"; wait "$front_pid" 2>/dev/null || true
+sock="$work/full.sock"
+server -f "$sock" -u "$(id -u)" -t 8 -i 60 -m 2 --max-connections-per-device 1 >full.log 2>&1
+sleep 0.3
+python3 "$here/front.py" 25340,25341 "$sock" 8 t.example dev-a,dev-b & front_pid=$!; pids+=($front_pid)
+sleep 0.3
+"$build/slipstream-client" -l 25440 -r 127.0.0.1:25340 -d pppppppppppppppp.t.example >full-a1.log 2>&1 & a1=$!; pids+=($a1)
+"$build/slipstream-client" -l 25441 -r 127.0.0.1:25341 -d pppppppppppppppp.t.example >full-b.log 2>&1 & pids+=($!)
+sleep 2
+echo_through 25440 || fail "echo of the first device on a server of two places"
+echo_through 25441 || fail "echo of the second device on a server of two places"
+kill -9 "$a1"; wait "$a1" 2>/dev/null || true
+"$build/slipstream-client" -l 25442 -r 127.0.0.1:25340 -d pppppppppppppppp.t.example >full-a2.log 2>&1 & pids+=($!)
+echo_through 25442 || fail "the device's client restarted on a full server: $(tail -3 full.log)"
+grep -q 'gives way to its new one' full.log || fail "no eviction logged: $(tail -3 full.log)"
+echo "ok: a full server, a restart gets in"
 
 # a stranger on the front socket
 server -f "$work/uid.sock" -u 4242 >uid.log 2>&1

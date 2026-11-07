@@ -17,7 +17,7 @@ of a UDP socket, and is hardened for queries from anyone.
 | `--alpn ALPN` | required: the ALPN clients must offer (no shared default: it is in every Initial packet) |
 | `--cert`, `--key` | required: no default to the public test key |
 | `--idle-timeout S` | seconds a connection may stay silent before it goes (default 120; upstream: never); a handshake has 10 s |
-| `--max-connections N` | connections at once (default 64; upstream: 8) |
+| `--max-connections N` | connections at once (default 64; upstream: 8); a device's connection silent 5 s gives way to its new one on a full server too |
 | `--max-streams N` | streams at once per connection (default 64) |
 | `--max-pending-mib N` | bytes queued towards the target, all streams together (default 64 MiB) |
 | `--tag-len N` | bytes at the start of each query's data that the front checked (dnsauth-v2: 8) |
@@ -46,10 +46,20 @@ version 2, the answers staying in version 1:
 
 The device is a token of the front's (a hash of the device's ID), the same for all its queries. The first packet
 picoquic takes for a new connection decides, once, the device it holds a place of (none when that packet came in
-version 1); `--max-connections-per-device` counts by it. A connection closed before (a CONNECTION_CLOSE in its
-handshake) holds no place.
-Without it (version 1, or UDP) a connection has no device and no such limit: one device's key could otherwise take
-every connection of the server, the others' waiting out the idle timeout.
+version 1); `--max-connections-per-device` counts by it. Without it (version 1, or UDP) a connection has no device
+and no such limit: one device's key could otherwise take every connection of the server, the others' waiting out the
+idle timeout. A holder of one device's key who sees another device's query on the path and sends it first in a query
+of its own gets that connection counted as its own (the copy race slipstream-v1 §1 item 5 admits): the other device
+gains a place, and nobody is locked out.
+
+The server counts the places itself, `--max-connections` too: picoquic's own table is a little larger and never
+refuses first (its SERVER_BUSY ended the client, and a device's old connection never gave way when the server was
+full). A connection holds a place from the first packet taken for it until it closes, fails its handshake or goes
+silent past the idle timeout. What holds no place is deleted between batches: connections closed (by the client or
+the server: the server sends only in answers, so its close went with the answer to the query that closed it), failed
+handshakes, and connections picoquic made for a packet it then refused (a datagram's later segment with another
+connection ID). Each of these kept one of picoquic's places for the handshake's 10 s or the idle timeout, and one
+device's key could fill them all.
 
 ## What the server answers
 
