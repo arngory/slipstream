@@ -370,7 +370,7 @@ static size_t slipstream_pending_total = 0;
 static size_t slipstream_pending_max = 64 * 1024 * 1024;
 static size_t slipstream_max_connections = 64;
 static size_t slipstream_max_device_connections = 0; /* 0: no limit */
-static uint64_t slipstream_device_evict_us = 30000000; /* a device's connection silent this long gives way */
+static uint64_t slipstream_device_evict_us = 5000000; /* a device's connection silent this long gives way */
 #define SLIPSTREAM_WRITE_BUDGET (64 * 1024)
 #define SLIPSTREAM_CONNECT_TIMEOUT_US (30ULL * 1000000)
 
@@ -405,8 +405,10 @@ typedef struct st_slipstream_server_ctx_t {
     slipstream_server_stream_ctx_t* first_stream;
     struct sockaddr_storage upstream_addr;
     size_t pending_bytes; /* queued towards the target, all this connection's streams */
-    /* The device of the first packet taken for the connection, as the
-     * front named it (--max-connections-per-device). */
+    /* Whether the first packet taken for the connection named a device (the
+     * front, IPC version 2), and which: --max-connections-per-device
+     * decides once, on that packet. */
+    bool device_decided;
     bool has_device;
     uint64_t device;
     struct st_slipstream_server_ctx_t* prev_ctx;
@@ -801,6 +803,13 @@ static void slipstream_server_reap(picoquic_quic_t* quic) {
         if (cnx->cnx_state == picoquic_state_disconnected || now >= deadline) {
             cnx->local_error = PICOQUIC_ERROR_IDLE_TIMEOUT;
             picoquic_connection_disconnect(cnx);
+            /* No context outlives its connection (the close callback frees
+             * it; this one is here when no callback came). */
+            slipstream_server_ctx_t* ctx = picoquic_get_callback_context(cnx);
+            if (ctx != NULL && ctx != picoquic_get_default_callback_context(quic)) {
+                picoquic_set_callback(cnx, NULL, NULL);
+                slipstream_server_free_context(ctx);
+            }
             picoquic_delete_cnx(cnx);
         }
         cnx = next;
@@ -812,14 +821,17 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
                                picoquic_call_back_event_t fin_or_event, void* callback_ctx, void* v_stream_ctx);
 
 /* server_ctx_of is the connection's own context, made at its first use (a
- * callback, or the first packet taken for it). NULL without memory, the
- * connection closed. */
+ * callback, or the first packet taken for it) while it still has the
+ * default one picoquic gives a new connection. NULL without memory, and
+ * for a connection whose context is gone (NULL: closed, its callback
+ * cleared): one made then would outlive it (review: a CONNECTION_CLOSE in
+ * the handshake, then the reaper, left a context on freed memory). */
 static slipstream_server_ctx_t* server_ctx_of(picoquic_cnx_t* cnx, slipstream_server_ctx_t* server_ctx) {
     slipstream_server_ctx_t* default_ctx = picoquic_get_default_callback_context(picoquic_get_quic_ctx(cnx));
     if (server_ctx != NULL && server_ctx != default_ctx) {
         return server_ctx;
     }
-    if (default_ctx == NULL) {
+    if (server_ctx == NULL || default_ctx == NULL || cnx->cnx_state >= picoquic_state_disconnecting) {
         return NULL;
     }
     server_ctx = calloc(1, sizeof(*server_ctx));
@@ -839,32 +851,47 @@ static slipstream_server_ctx_t* server_ctx_of(picoquic_cnx_t* cnx, slipstream_se
     return server_ctx;
 }
 
-/* server_device_admit gives a connection the device of the first packet
- * picoquic took for it (the front names it, IPC version 2), within
- * --max-connections-per-device: one device's key cannot take every
- * connection of the server (slipstream-v1 §3). Over the limit, the device's
- * connection silent longest goes when it has been silent
- * slipstream_device_evict_us (a phone on a new network leaves the old one
- * behind), else the new one does: false, and it is closed. Not before
- * every packet: a connection keeps the device it started with. */
-static bool server_device_admit(picoquic_cnx_t* cnx, uint64_t device, uint64_t now) {
+/* server_alive: a connection that holds a place of its device's. */
+static bool server_alive(const picoquic_cnx_t* cnx) {
+    return cnx != NULL && cnx->cnx_state < picoquic_state_disconnecting &&
+        cnx->cnx_state != picoquic_state_handshake_failure && cnx->cnx_state != picoquic_state_handshake_failure_resend;
+}
+
+/* server_device_admit decides once, on the first packet picoquic takes for
+ * a connection, the device it holds a place of (the front names it, IPC
+ * version 2; a first packet without one, version 1 or UDP, gives it none
+ * for good), within --max-connections-per-device: one device's key cannot
+ * take every connection of the server (slipstream-v1 §3). Over the limit,
+ * the device's connection silent longest goes when it has been silent
+ * slipstream_device_evict_us (its keepalives come every 400 ms: a client
+ * restarted, or a phone on a new network, left it behind), else the new
+ * one does: false, and the caller closes it. A connection closed already
+ * (a CONNECTION_CLOSE in the packet) takes no place. */
+static bool server_device_admit(picoquic_cnx_t* cnx, bool has_device, uint64_t device, uint64_t now) {
+    if (!server_alive(cnx)) {
+        return true;
+    }
     slipstream_server_ctx_t* ctx = server_ctx_of(cnx, picoquic_get_callback_context(cnx));
     if (ctx == NULL) {
-        return false;
+        return true; /* no memory: picoquic_close'd */
     }
-    if (ctx->has_device || slipstream_max_device_connections == 0) {
-        if (!ctx->has_device) {
-            ctx->has_device = true;
-            ctx->device = device;
-        }
+    if (ctx->device_decided) {
+        return true;
+    }
+    ctx->device_decided = true;
+    if (!has_device) {
+        return true;
+    }
+    if (slipstream_max_device_connections == 0) {
+        ctx->has_device = true;
+        ctx->device = device;
         return true;
     }
     slipstream_server_ctx_t* default_ctx = picoquic_get_default_callback_context(picoquic_get_quic_ctx(cnx));
     size_t count = 0;
     slipstream_server_ctx_t* silent = NULL;
     for (slipstream_server_ctx_t* other = default_ctx->next_ctx; other != NULL; other = other->next_ctx) {
-        if (other == ctx || !other->has_device || other->device != device || other->cnx == NULL ||
-            other->cnx->cnx_state >= picoquic_state_disconnecting) {
+        if (other == ctx || !other->has_device || other->device != device || !server_alive(other->cnx)) {
             continue;
         }
         count++;
@@ -875,6 +902,11 @@ static bool server_device_admit(picoquic_cnx_t* cnx, uint64_t device, uint64_t n
     if (count >= slipstream_max_device_connections) {
         if (silent == NULL || now < silent->cnx->latest_receive_time ||
             now - silent->cnx->latest_receive_time < slipstream_device_evict_us) {
+            static uint64_t logged;
+            if (now - logged >= 10000000) { /* a waiting client retries every second */
+                logged = now;
+                fprintf(stderr, "A device's new connection refused: it has %zu (--max-connections-per-device)\n", count);
+            }
             return false;
         }
         /* Silent that long, no query of this batch is bound to it (a slot
@@ -1467,7 +1499,7 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
             if (ret != 0 || last_cnx == NULL || last_cnx->latest_receive_time != receive_time) {
                 continue; /* answered empty */
             }
-            if (slot->has_device && !server_device_admit(last_cnx, slot->device, receive_time)) {
+            if (slipstream_max_device_connections > 0 && !server_device_admit(last_cnx, slot->has_device, slot->device, receive_time)) {
                 /* The device has its connections: the new one goes, and
                  * the reaper deletes it. Answered empty; a retry of the
                  * same packet is no copy. */
@@ -1574,9 +1606,10 @@ int picoquic_slipstream_server(const slipstream_server_config_t* cfg) {
     slipstream_pending_max = cfg->max_pending;
     slipstream_max_connections = cfg->max_connections;
     slipstream_max_device_connections = cfg->max_device_connections;
-    /* Within the idle timeout: a connection silent that long is gone
-     * anyway (30 s, or half of a shorter timeout). */
-    slipstream_device_evict_us = MIN((uint64_t)30000000, cfg->idle_timeout_ms * 500);
+    /* A few keepalives missed (5 s, or half of a shorter idle timeout):
+     * the client's handshake gives up after 30 s, and a restarted one
+     * must get in before (review). */
+    slipstream_device_evict_us = MIN((uint64_t)5000000, cfg->idle_timeout_ms * 500);
 
     /* The packets taken, for copies (4 MiB). */
     seen_packets.gens[0] = calloc(SEEN_SLOTS, sizeof(uint64_t));

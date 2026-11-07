@@ -46,7 +46,7 @@ jobs:
       - name: A client for the checks
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libssl-dev ninja-build meson
+          sudo apt-get install -y cmake pkg-config libssl-dev ninja-build meson python3-cryptography
           meson setup --buildtype=release --warnlevel=0 build
           ninja -C build slipstream-client
 

@@ -78,13 +78,13 @@ done
 
 # a device's connections at once (--max-connections-per-device 1, the front
 # names the device in IPC version 2): a second client of the same device
-# gets nothing while the first is busy, another device gets through; the
-# first silent past the eviction (half the idle timeout here), the second
-# takes its place before the timeout would have ended it.
+# gets nothing while the first is busy, another device gets through; a
+# client restarted at once gets in when the old connection has been silent
+# past the eviction (5 s), well before its handshake gives up (30 s).
 sock="$work/device.sock"
 server -f "$sock" -u "$(id -u)" -t 8 -i 12 --max-connections-per-device 1 >device.log 2>&1
 sleep 0.3
-python3 "$here/front.py" 25320,25321 "$sock" 8 t.example dev-a,dev-b & pids+=($!)
+python3 "$here/front.py" 25320,25321 "$sock" 8 t.example dev-a,dev-b & front_pid=$!; pids+=($front_pid)
 sleep 0.3
 "$build/slipstream-client" -l 25420 -r 127.0.0.1:25320 -d pppppppppppppppp.t.example >device-a1.log 2>&1 &
 a1=$!; pids+=($a1)
@@ -101,15 +101,30 @@ s = socket.create_connection(('127.0.0.1', 25421), timeout=6); s.sendall(b'x' * 
 sys.exit(0 if s.recv(1000) else 1)" 2>/dev/null; then
   fail "a second connection of the device got through"
 fi
-# Both of the device's clients go (the refused one would take the place
-# the moment the first is silent long enough).
+grep -q 'new connection refused' device.log || fail "no refusal logged: $(tail -3 device.log)"
 kill "$a1" "$a2"; wait "$a1" "$a2" 2>/dev/null || true
-sleep 7 # silent past the eviction (6 s), within the idle timeout (12 s)
 "$build/slipstream-client" -l 25423 -r 127.0.0.1:25320 -d pppppppppppppppp.t.example >device-a3.log 2>&1 & pids+=($!)
-sleep 3
-echo_through 25423 || fail "the device's new connection after its silent one"
+echo_through 25423 || fail "the device's client restarted at once"
 grep -q 'gives way to its new one' device.log || fail "no eviction logged: $(tail -3 device.log)"
-echo "ok: a device's connections at once, another device beside it, the silent one evicted"
+echo "ok: a device's connections at once, another device beside it, a restart gets in"
+
+# A connection that closes in its handshake holds no place (review: its
+# context outlived it and locked the device out for good).
+if python3 -c 'import cryptography' 2>/dev/null; then
+  kill "$front_pid"; wait "$front_pid" 2>/dev/null || true
+  sock="$work/close.sock"
+  server -f "$sock" -u "$(id -u)" -t 8 -i 12 --max-connections-per-device 1 >close.log 2>&1
+  sleep 0.3
+  timeout 20 python3 "$here/close.py" "$sock" t.example >/dev/null || fail "close.py"
+  python3 "$here/front.py" 25330 "$sock" 8 t.example dev-a & pids+=($!)
+  sleep 0.3
+  "$build/slipstream-client" -l 25430 -r 127.0.0.1:25330 -d pppppppppppppppp.t.example >close-client.log 2>&1 & pids+=($!)
+  sleep 2
+  echo_through 25430 || fail "the device locked out after a connection closed in its handshake: $(tail -3 close.log)"
+  echo "ok: a connection closed in its handshake holds no place"
+else
+  echo "skip: no python3 cryptography for the close in the handshake"
+fi
 
 # a stranger on the front socket
 server -f "$work/uid.sock" -u 4242 >uid.log 2>&1

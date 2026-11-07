@@ -21,7 +21,7 @@ of a UDP socket, and is hardened for queries from anyone.
 | `--max-streams N` | streams at once per connection (default 64) |
 | `--max-pending-mib N` | bytes queued towards the target, all streams together (default 64 MiB) |
 | `--tag-len N` | bytes at the start of each query's data that the front checked (dnsauth-v2: 8) |
-| `--max-connections-per-device N` | connections at once of one device, as the front names it (IPC version 2): over it, the device's connection silent longest goes if silent 30 s (or half a shorter `--idle-timeout`), else the new one does (default 0: no limit; at most `--max-connections`) |
+| `--max-connections-per-device N` | connections at once of one device, as the front names it (IPC version 2): over it, the device's connection silent longest goes if silent 5 s (or half a shorter `--idle-timeout`; a client's keepalives come every 400 ms), else the new one does (default 0: no limit; at most `--max-connections`) |
 
 ## IPC with the front
 
@@ -45,7 +45,9 @@ version 2, the answers staying in version 1:
 ```
 
 The device is a token of the front's (a hash of the device's ID), the same for all its queries. The first packet
-picoquic takes for a new connection gives the connection its device; `--max-connections-per-device` counts by it.
+picoquic takes for a new connection decides, once, the device it holds a place of (none when that packet came in
+version 1); `--max-connections-per-device` counts by it. A connection closed before (a CONNECTION_CLOSE in its
+handshake) holds no place.
 Without it (version 1, or UDP) a connection has no device and no such limit: one device's key could otherwise take
 every connection of the server, the others' waiting out the idle timeout.
 
