@@ -49,19 +49,15 @@ jobs:
         run: python3 .github/scripts/client_pin_test.py meson-build-release
 
   server-interop:
-    name: Against the hardened server
+    name: Against the released server
     runs-on: ubuntu-latest
     env:
-      # the server's branch as its session pins it for interop (server/hardening)
-      SERVER_COMMIT: 4f4143421bae2dad2139f5e0aa328d0f380e6d8d
+      # the server as raycontrol ships it: the static release of the server's session (server-v0.1.0, 5e0a8c3)
+      SERVER_RELEASE: https://github.com/arngory/slipstream/releases/download/server-v0.1.0
+      SERVER_SHA256_AMD64: cd98777d07c413f25e1f269067e4979187813ffe21fef48899e476b9c7a61fe7
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          submodules: recursive
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ env.SERVER_COMMIT }}
-          path: server-src
           submodules: recursive
 
       - name: Install build dependencies
@@ -70,13 +66,16 @@ jobs:
           sudo apt install -y cmake git pkg-config libssl-dev ninja-build gcc g++ python3-pip
           pip3 install meson
 
-      - name: Build this client and that server
+      - name: Build this client; the released server
         run: |
           meson setup --buildtype=release --warnlevel=0 build-client > /dev/null && ninja -C build-client slipstream-client
-          (cd server-src && meson setup --buildtype=release --warnlevel=0 build > /dev/null && ninja -C build slipstream-server)
+          mkdir -p server-bin
+          curl -fsSL --retry 3 -o server-bin/slipstream-server "$SERVER_RELEASE/slipstream-server-linux-amd64"
+          echo "$SERVER_SHA256_AMD64  server-bin/slipstream-server" | sha256sum -c -
+          chmod +x server-bin/slipstream-server
 
       - name: The client against the server
-        run: python3 .github/scripts/server_interop.py build-client server-src/build
+        run: python3 .github/scripts/server_interop.py build-client server-bin
 
   android:
     name: Android (${{ matrix.abi }})
