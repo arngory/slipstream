@@ -310,9 +310,10 @@ try:
     check("tagged, another key", ask(7005, time.monotonic() + 20), b"")
     check("tagged, another clock", ask(7006, time.monotonic() + 20), b"")
     check("tagged, the clock behind", ask(7009, time.monotonic() + 20), b"")
-    if dict(procs)["tagged, the clock behind"].poll() is not None:
-        failures.append("tagged, the clock behind: the client ended (%s): its offset not taken"
-                        % dict(procs)["tagged, the clock behind"].returncode)
+    # its arguments taken: not the arguments' exit 1 (its handshake, refused at the front, gives up with 2 after 30 s;
+    # that the front saw its queries is checked below)
+    if dict(procs)["tagged, the clock behind"].poll() == 1:
+        failures.append("tagged, the clock behind: exit 1, its arguments refused")
     check("quiet", ask(7007, time.monotonic() + 60), b"answer to hello\n")
     print("fronts: the key %s, another key %s, another clock %s" % (tagged_front, other_front, clock_front))
     if tagged_front["passed"] == 0 or tagged_front["refused"] != 0:
