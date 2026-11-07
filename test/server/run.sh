@@ -21,8 +21,8 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout key
   -days 1 -subj /CN=x 2>/dev/null
 python3 "$here/echo.py" 25201 & pids+=($!)
 server() { "$server_bin" -a 127.0.0.1:25201 -c cert.pem -k key.pem -d t.example -n picoquic_sample "$@" & pids+=($!); }
-echo_through() { # port
-  timeout 90 python3 - "$1" <<'PY'
+echo_through() { # port [timeout]
+  timeout "${2:-90}" python3 - "$1" <<'PY'
 import socket, os, sys
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=60)
 data = os.urandom(200000); s.sendall(data); got = b""
@@ -128,6 +128,21 @@ if python3 -c 'import cryptography' 2>/dev/null; then
   echo_through 25430 || fail "the device locked out by its connections that hold no place: $(tail -3 held.log)"
   echo_through 25431 || fail "another device locked out by them: $(tail -3 held.log)"
   echo "ok: connections closed or failed in the handshake, or never taken, hold no place"
+
+  # Handshakes left pending, four a device (70, -m 200): past 64 picoquic
+  # answered every new connection with a Retry that went nowhere until
+  # they timed out (10 s; review). A new device gets in at once.
+  kill "$front_pid"; wait "$front_pid" 2>/dev/null || true
+  sock="$work/pending.sock"
+  server -f "$sock" -u "$(id -u)" -t 8 -i 12 -m 200 --max-connections-per-device 4 >pending.log 2>&1
+  sleep 0.3
+  timeout 20 python3 "$here/close.py" "$sock" t.example pending 70 >/dev/null || fail "close.py pending"
+  python3 "$here/front.py" 25335 "$sock" 8 t.example dev-b & front_pid=$!; pids+=($front_pid)
+  sleep 0.3
+  "$build/slipstream-client" -l 25435 -r 127.0.0.1:25335 -d pppppppppppppppp.t.example >pending-b.log 2>&1 & pids+=($!)
+  sleep 2
+  echo_through 25435 4 || fail "a new device kept out by 70 pending handshakes: $(tail -3 pending.log)"
+  echo "ok: 70 pending handshakes keep no new device out"
 else
   echo "skip: no python3 cryptography for connections that hold no place"
 fi

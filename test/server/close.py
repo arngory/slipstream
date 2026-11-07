@@ -10,9 +10,12 @@ device's:
           fails (held to the handshake's 10 s, uncounted);
   orphan  a datagram of two Initials with different connection IDs:
           picoquic makes the second's connection, then refuses the segment
-          (nothing took it; held 10 s).
+          (nothing took it; held 10 s);
+  pending handshakes left pending (the start of a ClientHello), four a
+          device, devices p0000000, p0000001...: past 64 of them picoquic
+          answered every new connection with a Retry that went nowhere.
 
-close.py SOCKET DOMAIN [MODE [COUNT]] (MODE close, fail, orphan or all;
+close.py SOCKET DOMAIN [MODE [COUNT]] (MODE close, fail, orphan, all or pending;
 default close 1), the server with --tag-len 8 (needs python3-cryptography)"""
 import socket, struct, sys, os, time, base64
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
@@ -66,15 +69,19 @@ def addr(port):
 sock_path, domain = sys.argv[1], sys.argv[2]
 device = b'dev-a\x00\x00\x00'
 f = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET); f.connect(sock_path)
-def send(pkt):
+def send(pkt, device=device):
     m = b'NU\x02' + addr(40000) + addr(53) + device + query(pkt, domain)
     f.send(m)
 mode = sys.argv[3] if len(sys.argv) > 3 else 'close'
 count = int(sys.argv[4]) if len(sys.argv) > 4 else 1
 kinds = ['close', 'fail', 'orphan'] if mode == 'all' else [mode]
 for m in kinds:
-    for _ in range(count):
+    for i in range(count):
         d, sc = os.urandom(8), os.urandom(8)
+        if m == 'pending':
+            send(initial(d, sc, 0, crypto_frame(partial_client_hello())), b'p%07d' % (i // 4))
+            time.sleep(0.01)
+            continue
         if m == 'orphan':
             send(initial(d, b'', 0, b'\x01', pad=4) + initial(os.urandom(8), b'', 0, b'\x01', pad=49))
             continue

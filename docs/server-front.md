@@ -59,7 +59,9 @@ silent past the idle timeout. What holds no place is deleted between batches: co
 the server: the server sends only in answers, so its close went with the answer to the query that closed it), failed
 handshakes, and connections picoquic made for a packet it then refused (a datagram's later segment with another
 connection ID). Each of these kept one of picoquic's places for the handshake's 10 s or the idle timeout, and one
-device's key could fill them all.
+device's key could fill them all. Handshakes count among the places; picoquic's own threshold for answering with a
+Retry (64 handshakes) is off, as a Retry goes nowhere here. A packet picoquic closes the connection for (a frame it
+takes as a protocol violation) gets the close in its answer: the connection goes before the next query.
 
 ## What the server answers
 

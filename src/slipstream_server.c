@@ -1531,6 +1531,20 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
             if (last_cnx != NULL) {
                 server_keep_horizon(last_cnx);
             }
+            if (ret == 0 && last_cnx != NULL && last_cnx->latest_receive_time != receive_time &&
+                (last_cnx->cnx_state == picoquic_state_disconnecting ||
+                 last_cnx->cnx_state == picoquic_state_handshake_failure)) {
+                /* A packet picoquic closed the connection for (a frame it
+                 * takes as a protocol violation): it reports the packet
+                 * dropped, so its time is not taken. The close goes in this
+                 * answer, as the reaper deletes the connection before the
+                 * next query; unanswered, the client waited out the idle
+                 * timeout (review). A copy bound here takes only the
+                 * close. */
+                slot->s.cnx = last_cnx;
+                slot->s.path_id = -1;
+                continue;
+            }
             if (ret != 0 || last_cnx == NULL || last_cnx->latest_receive_time != receive_time) {
                 continue; /* answered empty */
             }
@@ -1721,6 +1735,12 @@ int picoquic_slipstream_server(const slipstream_server_config_t* cfg) {
     }
 
     picoquic_set_cookie_mode(quic, 0);
+    /* Past 64 handshakes at once picoquic answers a new connection with a
+     * Retry, before server_admit, and a Retry goes nowhere here
+     * (server_drop_stateless): 64 handshakes held kept every new connection
+     * out whatever --max-connections allows (review). server_admit counts
+     * handshakes among the places. */
+    picoquic_set_max_half_open_retry_threshold(quic, UINT32_MAX);
     /* A connection that never finishes its handshake held its place for the
      * idle timeout (review): 10 s, as the reaper reads it too. */
     picoquic_set_default_handshake_timeout(quic, 10 * 1000000ULL);
