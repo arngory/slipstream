@@ -24,6 +24,17 @@
 #include "slipstream.h"
 #include "slipstream_dnsauth.h"
 #include "slipstream_mtu.h"
+
+/* picoquic refuses an initial send MTU below its enforced one, and the server's is the same build option */
+#if !defined(PICOQUIC_ENFORCED_INITIAL_MTU) || PICOQUIC_ENFORCED_INITIAL_MTU != SLIPSTREAM_MIN_MTU
+#error "picoquic's PICOQUIC_ENFORCED_INITIAL_MTU must be SLIPSTREAM_MIN_MTU (64)"
+#endif
+
+/* The receive window, for the connection and each stream, fixed: the server's (SLIPSTREAM_SERVER_WINDOW). picoquic
+ * keeps out-of-order stream data up to 64 times the free window and otherwise grows the window as data arrives. */
+#ifndef SLIPSTREAM_CLIENT_WINDOW
+#define SLIPSTREAM_CLIENT_WINDOW (256 * 1024)
+#endif
 #include "slipstream_inline_dots.h"
 #include "slipstream_pin.h"
 #include "slipstream_utils.h"
@@ -845,11 +856,11 @@ int picoquic_slipstream_client(const char* listen_host, int listen_port, struct 
     client_domain_name = strdup(domain_name);
     client_domain_name_len = strlen(domain_name);
 
-    /* the largest packet whose name fits under the zone, the dnsauth-v2 field in front of it: a zone of 29
-     * characters still leaves the server's least (the estimate (240 - L) / 1.6 stopped at 20) */
+    /* the largest packet whose name fits under the zone, the dnsauth-v2 field in front of it: a zone of up to 134
+     * characters leaves the server's least of 64 with the field, 148 without */
     const size_t mtu_fit = slipstream_client_mtu(client_domain_name_len, dnsauth != NULL ? SLIPSTREAM_DNSAUTH_LEN : 0);
     if (mtu_fit < SLIPSTREAM_MIN_MTU) {
-        fprintf(stderr, "The zone of %zu characters leaves packets of %zu bytes; the server takes %d at least\n",
+        fprintf(stderr, "The zone of %zu characters is too long: it leaves packets of %zu bytes, the server takes %d at least\n",
                 client_domain_name_len, mtu_fit, SLIPSTREAM_MIN_MTU);
         return 1;
     }
@@ -878,6 +889,7 @@ int picoquic_slipstream_client(const char* listen_host, int listen_port, struct 
     /* no TLS key log: the keys of the tunnel never leave the process */
     config.enable_sslkeylog = 0;
     config.alpn = tls->alpn;
+    config.flow_control_max = SLIPSTREAM_CLIENT_WINDOW;
 
     /* Create the QUIC context for the server */
     current_time = picoquic_current_time();
@@ -890,9 +902,16 @@ int picoquic_slipstream_client(const char* listen_host, int listen_port, struct 
     picoquic_register_all_congestion_control_algorithms();
     picoquic_quic_t* quic = picoquic_create_and_configure(&config, slipstream_client_callback, &client_ctx, current_time, NULL);
     if (quic == NULL) {
-        fprintf(stderr, "Could not create server context\n");
+        /* among the causes, an initial send MTU picoquic does not take (picoquic_set_initial_send_mtu) */
+        fprintf(stderr, "Could not create the QUIC context (packet size %d)\n", mtu);
         return -1;
     }
+    picoquic_tp_t tp = *picoquic_get_default_tp(quic);
+    tp.initial_max_data = SLIPSTREAM_CLIENT_WINDOW;
+    tp.initial_max_stream_data_bidi_local = SLIPSTREAM_CLIENT_WINDOW;
+    tp.initial_max_stream_data_bidi_remote = SLIPSTREAM_CLIENT_WINDOW;
+    tp.initial_max_stream_data_uni = SLIPSTREAM_CLIENT_WINDOW;
+    picoquic_set_default_tp(quic, &tp);
 
     picoquic_set_cookie_mode(quic, 0);
     picoquic_set_default_priority(quic, 2);

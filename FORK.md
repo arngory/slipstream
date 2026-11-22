@@ -10,11 +10,11 @@ side; `main` stays upstream's.
 | Branch | Side | What differs from upstream |
 |---|---|---|
 | **`server/hardening`** | raycontrol (the server) | the server hardened for queries from anyone, behind niko-server's DNS front (it names the device); copies of packets and abandoned paths kept in bounds; a limit of connections per device (`--max-connections-per-device`); a static build (Alpine, musl, OpenSSL linked in) for amd64 and arm64; releases `server-vX.Y.Z` with `SHA256SUMS` |
-| `client/pin-alpn-sni` | Niko (the client) | the client Niko embeds: the server's key by its pin, ALPN and SNI from the arguments, no key log; streams ended by their FIN; dnsauth-v2 in every query; idle and handshake timeouts; the Android build (4 ABIs, OpenSSL static); CI against the released server |
+| `client/pin-alpn-sni` | Niko (the client) | the client Niko embeds: the server's key by its pin, ALPN and SNI from the arguments, no key log; streams ended by their FIN; dnsauth-v2 in every query; idle and handshake timeouts; a fixed receive window of 256 KiB; zones up to 134 characters (packets down to 64 bytes); the Android build (4 ABIs, OpenSSL static); CI against the server (this tree's until the first release on the new picoquic, then the release) |
 
 Both build picoquic from [arngory/picoquic](https://github.com/arngory/picoquic), branch `slipstream` (upstream
 picoquic and the slipstream series; what each patch changes and why is in its `FORK.md`), not from
-EndPositive/slipstream-picoquic: the server from this line on, the client once it moves. The enforced initial MTU is a
+EndPositive/slipstream-picoquic: the server from `server/picoquic-port` on, the client since it merged that branch. The enforced initial MTU is a
 build option (`enforced_initial_mtu`, 64 by default) and must match picoquic's, or the link fails. Multipath moved to
 draft-20 there: a new client does not work with an older server, so the server is released first.
 

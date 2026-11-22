@@ -29,6 +29,8 @@ set(ENABLE_UBSAN OFF CACHE BOOL "" FORCE)
 # fusion is AES-NI on x86 only: OpenSSL's AES serves every ABI alike
 set(WITH_FUSION OFF CACHE BOOL "" FORCE)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+# the server's floor (SLIPSTREAM_MIN_MTU); FORCE, so an older build directory's cache does not keep another value
+set(PICOQUIC_ENFORCED_INITIAL_MTU 64 CACHE STRING "" FORCE)
 include(FetchContent)
 add_subdirectory(${ROOT}/subprojects/picoquic picoquic EXCLUDE_FROM_ALL)
 FetchContent_GetProperties(picotls)

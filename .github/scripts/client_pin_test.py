@@ -208,7 +208,7 @@ try:
     threading.Thread(target=target, daemon=True).start()
     start("server", [SERVER, "--dns-listen-port=%d" % DNS_PORT, "--dns-listen-address=127.0.0.1",
                      "--target-address=127.0.0.1:%d" % TARGET_PORT, "--cert=" + crt, "--key=" + key,
-                     "--domain=" + DOMAIN])
+                     "--domain=" + DOMAIN, "--alpn=picoquic_sample"])  # the client's default; the server has none
     time.sleep(1)
 
     refused_at_start("no --pin", )
