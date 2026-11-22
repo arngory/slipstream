@@ -25,8 +25,30 @@ typedef struct st_address_t {
     bool added;
 } address_t;
 
-int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addresses, size_t server_address_count, const char* domain_name,
-                               const char* cc_algo_id, bool gso, size_t keep_alive_interval);
+/* The client's TLS toward the server (slipstream-v1): the ALPN the server takes, the name the ClientHello carries,
+ * and the pin of the server's key (base64url SHA-256 of its SPKI; NULL: the certificate is not checked) */
+typedef struct st_slipstream_client_tls_t {
+    const char* alpn;
+    const char* sni;
+    const char* pin;
+} slipstream_client_tls_t;
+
+/* The client's exit codes besides 0 and 1 (the arguments): the handshake failed, or failed on the server's key */
+#define SLIPSTREAM_CLIENT_EXIT_HANDSHAKE 2
+#define SLIPSTREAM_CLIENT_EXIT_PIN 3
+
+/* dnsauth-v2 on every query (slipstream_dnsauth.h): the device's key for the slipstream service and the node's clock
+ * less the client's, in seconds (the subscription's time field) */
+typedef struct st_slipstream_client_dnsauth_t {
+    uint8_t key[32];
+    int64_t clock_offset;
+} slipstream_client_dnsauth_t;
+
+/* dnsauth NULL: queries without the field */
+int picoquic_slipstream_client(const char* listen_host, int listen_port, struct st_address_t* server_addresses,
+                               size_t server_address_count, const char* domain_name, const char* cc_algo_id, bool gso,
+                               size_t keep_alive_interval, const slipstream_client_tls_t* tls,
+                               const slipstream_client_dnsauth_t* dnsauth, uint64_t idle_timeout_ms);
 
 /* The server's settings (slipstream_server_cli.cpp fills them in). */
 typedef struct st_slipstream_server_config_t {

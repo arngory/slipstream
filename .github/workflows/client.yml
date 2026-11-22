@@ -1,0 +1,138 @@
+name: Client TLS
+
+on:
+  push:
+    branches:
+      - "client/**"
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pin:
+    name: Build, the pin and the streams on the loopback
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt install -y cmake git pkg-config libssl-dev ninja-build gcc g++ python3-pip
+          pip3 install meson
+
+      - name: Build as the release does
+        run: |
+          meson setup -Db_lto=true --buildtype=release --warnlevel=0 -Ddefault_library=static meson-build-release
+          ninja -C meson-build-release
+
+      - name: The pin and dnsauth code without warnings
+        working-directory: meson-build-release
+        run: |
+          for file in slipstream_pin.c slipstream_dnsauth.c slipstream_mtu.c; do
+            command=$(jq -r --arg f "$file" '[.[] | select(.file | endswith($f))][0].command' compile_commands.json)
+            test -n "$command" && test "$command" != null
+            # only this file's own lines: the headers of picoquic and picotls are not ours
+            eval "$command -Wall -Wextra -fsyntax-only" 2>&1 | tee "warnings-$file.txt"
+            ! grep -E "${file//./\\.}:[0-9]+:[0-9]+: (warning|error)" "warnings-$file.txt"
+          done
+
+      - name: dnsauth-v2 vectors
+        run: meson test -C meson-build-release --print-errorlogs
+
+      - name: The pin, dnsauth-v2 and the streams on the loopback
+        run: python3 .github/scripts/client_pin_test.py meson-build-release
+
+  server-interop:
+    name: Against the released server
+    runs-on: ubuntu-latest
+    env:
+      # the server as raycontrol ships it: the static release of the server's session (server-v0.2.0, dc5f41d)
+      SERVER_RELEASE: https://github.com/arngory/slipstream/releases/download/server-v0.2.0
+      SERVER_SHA256_AMD64: 59a0c3eb2a8bbbd8bdbd54c9ae8330d6e5e0dd328acab0e27d2f6f574d377b3f
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt install -y cmake git pkg-config libssl-dev ninja-build gcc g++ python3-pip
+          pip3 install meson
+
+      - name: Build this client; the released server
+        run: |
+          meson setup --buildtype=release --warnlevel=0 build-client > /dev/null && ninja -C build-client slipstream-client
+          mkdir -p server-bin
+          curl -fsSL --retry 3 -o server-bin/slipstream-server "$SERVER_RELEASE/slipstream-server-linux-amd64"
+          echo "$SERVER_SHA256_AMD64  server-bin/slipstream-server" | sha256sum -c -
+          chmod +x server-bin/slipstream-server
+
+      - name: The client against the server
+        run: python3 .github/scripts/server_interop.py build-client server-bin
+
+  android:
+    name: Android (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86, x86_64]
+    env:
+      # the NDK Niko builds its core with
+      NDK_VERSION: 28.2.13676358
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Install the NDK and ninja
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build
+          # the SDK's download breaks off now and then ("Premature EOF"): three tries
+          for try in 1 2 3; do
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" > /dev/null && break
+            test "$try" -lt 3 && sleep 10
+          done
+          test -f "$ANDROID_HOME/ndk/${NDK_VERSION}/source.properties"
+          echo "NDK=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: OpenSSL for the ABI
+        run: .github/scripts/android-openssl.sh "$NDK" "${{ matrix.abi }}" "$RUNNER_TEMP/openssl"
+
+      - name: Build the client
+        run: |
+          cmake -S android -B build-android -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${{ matrix.abi }}" -DANDROID_PLATFORM=android-23 -DANDROID_STL=c++_static \
+            -DOPENSSL_ROOT_DIR="$RUNNER_TEMP/openssl"
+          cmake --build build-android --target slipstream-client
+
+      - name: Only the system's libraries, 16 KB pages on 64-bit
+        run: |
+          readelf="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          file build-android/slipstream-client
+          "$readelf" -d build-android/slipstream-client | tee dynamic.txt
+          needed=$(grep NEEDED dynamic.txt | grep -oE '\[[^]]+\]' | tr -d '[]' | sort | tr '\n' ' ')
+          echo "needed: $needed"
+          for lib in $needed; do
+            case "$lib" in libc.so|libm.so|libdl.so|liblog.so) ;; *) echo "not a system library: $lib"; exit 1 ;; esac
+          done
+          # 16 KB pages are a 64-bit thing (Android 15+); the 32-bit ABIs keep 4 KB
+          case "${{ matrix.abi }}" in arm64-v8a|x86_64) align=0x4000 ;; *) align=0x1000 ;; esac
+          "$readelf" -lW build-android/slipstream-client \
+            | awk -v align="$align" '$1 == "LOAD" { print; if ($NF != align) bad = 1 } END { exit bad }'
+          mkdir -p out
+          cp build-android/slipstream-client out/libslipstream.so
+          sha256sum out/libslipstream.so
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: slipstream-client-android-${{ matrix.abi }}
+          path: out/libslipstream.so

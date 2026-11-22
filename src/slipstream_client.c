@@ -10,6 +10,8 @@
 #include <assert.h>
 #include <picoquic_internal.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <inttypes.h>
 #include <slipstream_sockloop.h>
 #include <stdbool.h>
 #include <arpa/nameser.h>
@@ -20,9 +22,14 @@
 #include "lua-resty-base-encoding-base32.h"
 #include "picoquic_config.h"
 #include "slipstream.h"
+#include "slipstream_dnsauth.h"
+#include "slipstream_mtu.h"
 #include "slipstream_inline_dots.h"
+#include "slipstream_pin.h"
 #include "slipstream_utils.h"
 #include "SPCDNS/src/dns.h"
+#include <openssl/rand.h>
+#include <picotls.h>
 #include "SPCDNS/src/mappings.h"
 
 volatile sig_atomic_t should_shutdown = 0;
@@ -39,6 +46,14 @@ typedef struct st_slipstream_client_stream_ctx_t {
     int fd;
     uint64_t stream_id;
     volatile sig_atomic_t set_active;
+    /* the list's reference and one per poller thread waiting on the socket: the last one frees the memory */
+    atomic_int refs;
+    /* out of the list: a poller still waiting stops, and its wake-up is not taken */
+    atomic_bool dead;
+    /* the local side ended (its FIN is on the stream; no more reading) */
+    bool local_fin;
+    /* the server's FIN came (the local side's write is shut) */
+    bool remote_fin;
 } slipstream_client_stream_ctx_t;
 
 typedef struct st_slipstream_client_ctx_t {
@@ -50,13 +65,40 @@ typedef struct st_slipstream_client_ctx_t {
     bool ready;
     bool closed;
     int listen_sock;
+    slipstream_client_tls_t tls;
+    /* the stream list: the accepter thread adds, the network thread walks and removes */
+    pthread_mutex_t streams_lock;
+    /* why the connection ended before it was ready, for the exit code (SLIPSTREAM_CLIENT_EXIT_*) */
+    int exit_code;
 } slipstream_client_ctx_t;
 
 char* client_domain_name = NULL;
 size_t client_domain_name_len = 0;
+/* dnsauth-v2: the field in front of each packet (the network thread only reads these once set) */
+static bool client_dnsauth = false;
+static slipstream_client_dnsauth_t client_dnsauth_conf;
 
 ssize_t client_encode_segment(dns_packet_t* packet, size_t* packet_len, const unsigned char* src_buf, size_t src_buf_len) {
     char name[255];
+    unsigned char tagged[SLIPSTREAM_DNSAUTH_LEN + 255];
+    if (client_dnsauth) {
+        /* hint || tag over the packet, then the packet: the node's front checks and strips the field */
+        if (src_buf_len > sizeof(tagged) - SLIPSTREAM_DNSAUTH_LEN) {
+            return -1;
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        uint32_t epoch = slipstream_dnsauth_epoch((int64_t)now.tv_sec + client_dnsauth_conf.clock_offset);
+        slipstream_dnsauth_field(client_dnsauth_conf.key, epoch, src_buf, src_buf_len, tagged);
+        memcpy(tagged + SLIPSTREAM_DNSAUTH_LEN, src_buf, src_buf_len);
+        src_buf = tagged;
+        src_buf_len += SLIPSTREAM_DNSAUTH_LEN;
+    }
+    /* base32 grows 8/5, a dot every 57: the name and the zone must fit in a DNS name (the field is in src_buf now) */
+    if (!slipstream_client_name_fits(src_buf_len, 0, client_domain_name_len)) {
+        DBG_PRINTF("a packet of %zu bytes does not fit in a name under the zone\n", src_buf_len);
+        return -1;
+    }
     const size_t len = b32_encode(&name[0], (const char*) src_buf, src_buf_len, true, false);
     const size_t encoded_len = slipstream_inline_dotify(name, 255, len);
     name[encoded_len] = '.';
@@ -78,7 +120,12 @@ ssize_t client_encode_segment(dns_packet_t* packet, size_t* packet_len, const un
     edns.opt.udp_payload = 1232;
 
     dns_query_t query = {0};
-    query.id = rand() % UINT16_MAX;
+    /* unpredictable, and not the same run in every client as an unseeded rand() gives */
+    uint16_t id = 0;
+    if (RAND_bytes((unsigned char*)&id, sizeof(id)) != 1) {
+        return -1;
+    }
+    query.id = id;
     query.query = true;
     query.opcode = OP_QUERY;
     query.rd = true;
@@ -222,6 +269,12 @@ slipstream_client_stream_ctx_t* slipstream_client_create_stream_ctx(picoquic_cnx
     }
 
     memset(stream_ctx, 0, sizeof(slipstream_client_stream_ctx_t));
+    stream_ctx->fd = sock_fd;
+    stream_ctx->stream_id = -1;
+    atomic_init(&stream_ctx->refs, 1);
+    atomic_init(&stream_ctx->dead, false);
+
+    pthread_mutex_lock(&client_ctx->streams_lock);
     if (client_ctx->first_stream == NULL) {
         client_ctx->first_stream = stream_ctx;
     } else {
@@ -229,13 +282,21 @@ slipstream_client_stream_ctx_t* slipstream_client_create_stream_ctx(picoquic_cnx
         stream_ctx->next_stream->previous_stream = stream_ctx;
         client_ctx->first_stream = stream_ctx;
     }
-    stream_ctx->fd = sock_fd;
-    stream_ctx->stream_id = -1;
+    pthread_mutex_unlock(&client_ctx->streams_lock);
 
     return stream_ctx;
 }
 
+static void slipstream_client_release_stream_ctx(slipstream_client_stream_ctx_t* stream_ctx) {
+    if (atomic_fetch_sub(&stream_ctx->refs, 1) == 1) {
+        free(stream_ctx);
+    }
+}
+
+/* Out of the list and off the QUIC stream, the socket closed; the memory goes with the last poller still holding it.
+ * The network thread only. */
 static void slipstream_client_free_stream_ctx(slipstream_client_ctx_t* client_ctx, slipstream_client_stream_ctx_t* stream_ctx) {
+    pthread_mutex_lock(&client_ctx->streams_lock);
     if (stream_ctx->previous_stream != NULL) {
         stream_ctx->previous_stream->next_stream = stream_ctx->next_stream;
     }
@@ -245,10 +306,21 @@ static void slipstream_client_free_stream_ctx(slipstream_client_ctx_t* client_ct
     if (client_ctx->first_stream == stream_ctx) {
         client_ctx->first_stream = stream_ctx->next_stream;
     }
+    pthread_mutex_unlock(&client_ctx->streams_lock);
 
-    stream_ctx->fd = close(stream_ctx->fd);
+    atomic_store(&stream_ctx->dead, true);
+    if (stream_ctx->stream_id != (uint64_t)-1 && client_ctx->cnx != NULL) {
+        /* picoquic calls back with no context from now on */
+        picoquic_unlink_app_stream_ctx(client_ctx->cnx, stream_ctx->stream_id);
+    }
+    if (stream_ctx->fd >= 0) {
+        /* wakes a poller waiting on it before the number can be another socket's */
+        shutdown(stream_ctx->fd, SHUT_RDWR);
+        close(stream_ctx->fd);
+        stream_ctx->fd = -1;
+    }
 
-    free(stream_ctx);
+    slipstream_client_release_stream_ctx(stream_ctx);
 }
 
 static void slipstream_client_free_context(slipstream_client_ctx_t* client_ctx) {
@@ -265,10 +337,13 @@ static void slipstream_client_free_context(slipstream_client_ctx_t* client_ctx) 
 }
 
 void slipstream_client_mark_active_pass(slipstream_client_ctx_t* client_ctx) {
+    pthread_mutex_lock(&client_ctx->streams_lock);
     slipstream_client_stream_ctx_t* stream_ctx = client_ctx->first_stream;
 
     while (stream_ctx != NULL) {
-        if (stream_ctx->set_active) {
+        if (stream_ctx->set_active && stream_ctx->local_fin) {
+            stream_ctx->set_active = 0;
+        } else if (stream_ctx->set_active) {
             if (stream_ctx->stream_id == -1) {
                 stream_ctx->stream_id = picoquic_get_next_local_stream_id(client_ctx->cnx, 0);
                 printf("[%lu:%d] assigned stream id\n", stream_ctx->stream_id, stream_ctx->fd);
@@ -279,6 +354,7 @@ void slipstream_client_mark_active_pass(slipstream_client_ctx_t* client_ctx) {
         }
         stream_ctx = stream_ctx->next_stream;
     }
+    pthread_mutex_unlock(&client_ctx->streams_lock);
 }
 
 void slipstream_add_paths(slipstream_client_ctx_t* client_ctx) {
@@ -381,20 +457,26 @@ typedef struct st_slipstream_client_poller_args {
 void* slipstream_client_poller(void* arg) {
     slipstream_client_poller_args* args = arg;
 
-    while (1) {
+    /* the stream may be freed while this waits: dead says so, and the memory stays until the release below */
+    while (!atomic_load(&args->stream_ctx->dead)) {
         struct pollfd fds;
         fds.fd = args->fd;
         fds.events = POLLIN;
         fds.revents = 0;
 
-        /* add timeout handlilng */
         int ret = poll(&fds, 1, 1000);
         if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
             perror("poll() failed");
             break;
         }
         if (ret == 0) {
             continue;
+        }
+        if (atomic_load(&args->stream_ctx->dead)) {
+            break;
         }
 
         args->stream_ctx->set_active = 1;
@@ -408,6 +490,7 @@ void* slipstream_client_poller(void* arg) {
         break;
     }
 
+    slipstream_client_release_stream_ctx(args->stream_ctx);
     free(args);
     pthread_exit(NULL);
 }
@@ -429,8 +512,13 @@ void* slipstream_client_accepter(void* arg) {
         socklen_t client_len = sizeof(client_addr);
         int client_sock = accept(args->fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_sock < 0) {
-            if (errno == EINTR) {
-                fprintf(stderr, "my ass?");
+            if (errno == EINTR || errno == ECONNABORTED) {
+                continue;
+            }
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                /* out of descriptors or memory for now: the listener stays, the next connection may fit */
+                perror("accept() failed");
+                usleep(100000);
                 continue;
             }
             perror("accept() failed");
@@ -450,13 +538,14 @@ void* slipstream_client_accepter(void* arg) {
         uint16_t client_port = ntohs(client_addr.sin_port);
 
         // Print the connection details
-        fprintf(stderr, "Accepted connection from %s:%u on socket %d\n", client_ip_str, client_port, client_sock);
+        printf("Accepted connection from %s:%u on socket %d\n", client_ip_str, client_port, client_sock);
         // --- End printing section ---
 
         slipstream_client_stream_ctx_t* stream_ctx = slipstream_client_create_stream_ctx(args->cnx, args->client_ctx, client_sock);
         if (stream_ctx == NULL) {
-            fprintf(stderr, "Could not initiate stream for %d", client_sock);
-            break;
+            fprintf(stderr, "Could not initiate stream for %d\n", client_sock);
+            close(client_sock);
+            continue;
         }
 
         stream_ctx->set_active = 1;
@@ -506,6 +595,8 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
                     printf("[%lu:%d] send: closed stream\n", stream_id, stream_ctx->fd);
 
                     (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
+                    (void)picoquic_stop_sending(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
+                    slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
                     return 0;
                 }
                 if (errno == EAGAIN) {
@@ -514,15 +605,22 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
 
                 printf("[%lu:%d] send: error: %s (%d)\n", stream_id, stream_ctx->fd, strerror(errno), errno);
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
+                (void)picoquic_stop_sending(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
+                slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
                 return 0;
             }
         }
         if (fin_or_event == picoquic_callback_stream_fin) {
             printf("[%lu:%d] fin\n", stream_id, stream_ctx->fd);
-            /* Close the local_sock fd */
-            close(stream_ctx->fd);
-            stream_ctx->fd = -1;
-            picoquic_unlink_app_stream_ctx(cnx, stream_id);
+            stream_ctx->remote_fin = true;
+            if (stream_ctx->local_fin) {
+                /* both sides ended */
+                slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
+            } else {
+                /* the server ended its side only: the local side reads to the end and may still send (a
+                 * half-close, as TCP has it) */
+                shutdown(stream_ctx->fd, SHUT_WR);
+            }
         }
         break;
     case picoquic_callback_stop_sending: /* Should not happen, treated as reset */
@@ -545,6 +643,21 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
     case picoquic_callback_close: /* Received connection close */
     case picoquic_callback_application_close: /* Received application close */
         printf("Connection closed.\n");
+        if (!client_ctx->ready && client_ctx->exit_code == 0) {
+            /* the handshake never ended: say why, so whoever runs the client can tell a wrong key from a server
+             * that does not answer */
+            uint64_t local_error = picoquic_get_local_error(cnx);
+            uint64_t remote_error = picoquic_get_remote_error(cnx);
+            if (local_error == PICOQUIC_TRANSPORT_CRYPTO_ERROR(PTLS_ALERT_BAD_CERTIFICATE) ||
+                local_error == PICOQUIC_TRANSPORT_CRYPTO_ERROR(PTLS_ALERT_CERTIFICATE_REQUIRED)) {
+                fprintf(stderr, "Handshake failed: the server's key is not the pinned one\n");
+                client_ctx->exit_code = SLIPSTREAM_CLIENT_EXIT_PIN;
+            } else {
+                fprintf(stderr, "Handshake failed: local error 0x%" PRIx64 ", remote error 0x%" PRIx64 "\n",
+                        local_error, remote_error);
+                client_ctx->exit_code = SLIPSTREAM_CLIENT_EXIT_HANDSHAKE;
+            }
+        }
         should_shutdown = true;
         break;
     case picoquic_callback_prepare_to_send:
@@ -558,9 +671,9 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
             // printf("[%lu:%d] recv->quic_send (available %d)\n", stream_id, stream_ctx->fd, length_available);
             if (ret < 0) {
                 printf("[%lu:%d] ioctl error: %s (%d)\n", stream_id, stream_ctx->fd, strerror(errno), errno);
-                /* TODO: why would it return an error? */
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
-                break;
+                slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
+                return 0;
             }
             ret = 0;
 
@@ -569,22 +682,34 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
                 char a;
                 ssize_t bytes_read = recv(stream_ctx->fd, &a, 1, MSG_PEEK | MSG_DONTWAIT);
                 // printf("[%lu:%d] recv->quic_send empty read %d bytes\n", stream_id, stream_ctx->fd, bytes_read);
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* errno only when the read failed: a stale EAGAIN must not start a poller on a socket at its end */
+                if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                     // printf("[%lu:%d] recv->quic_send empty errno set: %s\n", stream_id, stream_ctx->fd, strerror(errno));
                     /* No bytes available, wait for next event */
                     (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
                     printf("[%lu:%d] recv->quic_send: empty, disactivate\n\n", stream_id, stream_ctx->fd);
 
                     slipstream_client_poller_args* args = malloc(sizeof(slipstream_client_poller_args));
+                    if (args == NULL) {
+                        (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
+                        slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
+                        return 0;
+                    }
                     args->fd = stream_ctx->fd;
                     args->cnx = cnx;
                     args->client_ctx = client_ctx;
                     args->stream_ctx = stream_ctx;
 
+                    /* the poller's reference: the memory outlives a free while it waits */
+                    atomic_fetch_add(&stream_ctx->refs, 1);
                     pthread_t thread;
                     if (pthread_create(&thread, NULL, slipstream_client_poller, args) != 0) {
                         perror("pthread_create() failed for thread1");
+                        slipstream_client_release_stream_ctx(stream_ctx);
                         free(args);
+                        (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
+                        slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
+                        return 0;
                     }
 #ifdef __APPLE__
                     pthread_setname_np("slipstream_server_poller");
@@ -592,10 +717,17 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
                     pthread_setname_np(thread, "slipstream_server_poller");
 #endif
                     pthread_detach(thread);
+                    return 0;
                 }
                 if (bytes_read == 0) {
-                    printf("[%lu:%d] recv: closed stream\n", stream_id, stream_ctx->fd);
-                    (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
+                    /* the local side ended: the stream's FIN, not a reset, so the server's side still answers (a
+                     * request, then the half-close, then the answer) */
+                    printf("[%lu:%d] recv: end, fin\n", stream_id, stream_ctx->fd);
+                    (void)picoquic_provide_stream_data_buffer(bytes, 0, 1, 0);
+                    stream_ctx->local_fin = true;
+                    if (stream_ctx->remote_fin) {
+                        slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
+                    }
                     return 0;
                 }
                 if (bytes_read > 0) {
@@ -603,6 +735,11 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
                     (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 1);
                     break;
                 }
+                /* a reset or another error on the local side */
+                printf("[%lu:%d] recv: %s (%d)\n", stream_id, stream_ctx->fd, strerror(errno), errno);
+                (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
+                (void)picoquic_stop_sending(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
+                slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
                 return 0;
             }
 
@@ -614,15 +751,14 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
             // printf("[%lu:%d] recv->quic_send recv %d bytes into quic\n", stream_id, stream_ctx->fd, length_to_read);
             ssize_t bytes_read = recv(stream_ctx->fd, buffer, length_to_read, MSG_DONTWAIT);
             // printf("[%lu:%d] recv->quic_send recv done %d bytes into quic\n", stream_id, stream_ctx->fd, bytes_read);
-            if (bytes_read == 0) {
-                printf("Closed connection on sock %d on recv", stream_ctx->fd);
-                (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
-                return 0;
-            }
-            if (bytes_read < 0) {
-                fprintf(stderr, "recv: %s (%d)\n", strerror(errno), errno);
-                /* There should be bytes available, so a return value of 0 is an error */
+            if (bytes_read != length_to_read) {
+                /* FIONREAD said these bytes are there and only this thread reads: anything else leaves the buffer
+                 * picoquic was promised short */
+                fprintf(stderr, "[%lu:%d] recv: %zd of %d: %s (%d)\n", stream_id, stream_ctx->fd, bytes_read,
+                        length_to_read, bytes_read < 0 ? strerror(errno) : "short", bytes_read < 0 ? errno : 0);
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
+                (void)picoquic_stop_sending(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
+                slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
                 return 0;
             }
         }
@@ -646,7 +782,7 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
                                   picoquic_quic_t* quic, picoquic_cnx_t** cnx,
                                   slipstream_client_ctx_t* client_ctx) {
     int ret = 0;
-    char const* sni = SLIPSTREAM_SNI;
+    char const* sni = client_ctx->tls.sni;
     uint64_t current_time = picoquic_current_time();
 
     *cnx = NULL;
@@ -670,7 +806,7 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
 
     /* Create a client connection */
     *cnx = picoquic_create_cnx(quic, picoquic_null_connection_id, picoquic_null_connection_id,
-        (struct sockaddr*)server_address, current_time, 0, sni, SLIPSTREAM_ALPN, 1);
+        (struct sockaddr*)server_address, current_time, 0, sni, client_ctx->tls.alpn, 1);
     if (*cnx == NULL) {
         fprintf(stderr, "Could not create connection context\n");
         return -1;
@@ -698,7 +834,10 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
     return ret;
 }
 
-int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addresses, size_t server_address_count, const char* domain_name, const char* cc_algo_id, bool gso, const size_t keep_alive_interval) {
+int picoquic_slipstream_client(const char* listen_host, int listen_port, struct st_address_t* server_addresses,
+                               size_t server_address_count, const char* domain_name, const char* cc_algo_id, bool gso,
+                               const size_t keep_alive_interval, const slipstream_client_tls_t* tls,
+                               const slipstream_client_dnsauth_t* dnsauth, uint64_t idle_timeout_ms) {
     /* Start: start the QUIC process */
     int ret = 0;
     uint64_t current_time = 0;
@@ -706,9 +845,19 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     client_domain_name = strdup(domain_name);
     client_domain_name_len = strlen(domain_name);
 
-    double mtu_d = 240 - (double) client_domain_name_len;
-    mtu_d = mtu_d / 1.6;
-    int mtu = (int) mtu_d;
+    /* the largest packet whose name fits under the zone, the dnsauth-v2 field in front of it: a zone of 29
+     * characters still leaves the server's least (the estimate (240 - L) / 1.6 stopped at 20) */
+    const size_t mtu_fit = slipstream_client_mtu(client_domain_name_len, dnsauth != NULL ? SLIPSTREAM_DNSAUTH_LEN : 0);
+    if (mtu_fit < SLIPSTREAM_MIN_MTU) {
+        fprintf(stderr, "The zone of %zu characters leaves packets of %zu bytes; the server takes %d at least\n",
+                client_domain_name_len, mtu_fit, SLIPSTREAM_MIN_MTU);
+        return 1;
+    }
+    int mtu = (int) mtu_fit;
+    if (dnsauth != NULL) {
+        client_dnsauth_conf = *dnsauth;
+        client_dnsauth = true;
+    }
 
     /* Create config */
     picoquic_quic_config_t config;
@@ -726,13 +875,16 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     config.use_long_log = 1;
     config.do_preemptive_repeat = 1;
     config.disable_port_blocking = 1;
-    config.enable_sslkeylog = 1;
-    config.alpn = SLIPSTREAM_ALPN;
+    /* no TLS key log: the keys of the tunnel never leave the process */
+    config.enable_sslkeylog = 0;
+    config.alpn = tls->alpn;
 
     /* Create the QUIC context for the server */
     current_time = picoquic_current_time();
     // one connection only, freed in slipstream_client_free_context on picoquic close callback
     slipstream_client_ctx_t client_ctx = {0};
+    client_ctx.tls = *tls;
+    pthread_mutex_init(&client_ctx.streams_lock, NULL);
     /* Create QUIC context */
     /* picoquic resolves CC names only among registered algorithms */
     picoquic_register_all_congestion_control_algorithms();
@@ -748,10 +900,19 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     picoquic_set_qlog(quic, config.qlog_dir);
     debug_printf_push_stream(stderr);
 #endif
-    picoquic_set_key_log_file_from_env(quic);
+    /* the server's certificate by its pin, or not at all when none is given (--insecure) */
+    if (tls->pin != NULL && slipstream_set_pin(quic, tls->pin) != 0) {
+        fprintf(stderr, "Invalid --pin: the base64url SHA-256 of the server's public key, 43 characters\n");
+        picoquic_free(quic);
+        return -1;
+    }
     // picoquic_set_textlog(quic, "-");
     // picoquic_set_log_level(quic, 1);
-    // TODO: idle timeout?
+    /* a connection whose server went silent ends (and with it the client, which its runner starts anew) instead of
+     * holding on forever; the handshake waits 30 s whatever the idle timeout, so a server that never answers is told
+     * apart soon (exit 2) */
+    picoquic_set_default_idle_timeout(quic, idle_timeout_ms);
+    picoquic_set_default_handshake_timeout(quic, 30000000);
 
     /* Parse the server addresses directly */
     client_ctx.server_addresses = server_addresses;
@@ -782,7 +943,12 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
 
     struct sockaddr_in listen_addr = {0};
     listen_addr.sin_family = AF_INET;
-    listen_addr.sin_addr.s_addr = INADDR_ANY;
+    /* the loopback by default: on any other address the tunnel is anyone's on the network */
+    if (inet_pton(AF_INET, listen_host, &listen_addr.sin_addr) != 1) {
+        fprintf(stderr, "Invalid listen address %s (an IPv4 address)\n", listen_host);
+        close(client_ctx.listen_sock);
+        exit(EXIT_FAILURE);
+    }
     listen_addr.sin_port = htons(listen_port);
 
     if (bind(client_ctx.listen_sock, (struct sockaddr*)&listen_addr, sizeof(listen_addr)) < 0) {
@@ -797,7 +963,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
         exit(EXIT_FAILURE);
     }
 
-    printf("Listening on port %d...\n", listen_port);
+    printf("Listening on %s port %d...\n", listen_host, listen_port);
 
     picoquic_packet_loop_param_t param = {0};
     param.local_af = client_ctx.server_addresses[0].server_address.ss_family;
@@ -846,5 +1012,8 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
 
     picoquic_free(quic);
 
+    if (client_ctx.exit_code != 0) {
+        return client_ctx.exit_code;
+    }
     return ret;
 }

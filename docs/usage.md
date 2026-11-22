@@ -34,8 +34,38 @@ The client is placed inside the restricted network.
 ```shell
 $ slipstream-client \
   --resolver-address=x.x.x.x:yy \ # Address of public DNS resolver or DHCP assigned resolver
-  --domain=test.com
+  --domain=test.com \
+  --pin=<base64url SHA-256 of the server's public key>
 ```
+
+The client checks the server by the pin of its public key: the base64url (no padding) SHA-256 of the certificate's
+SubjectPublicKeyInfo. No CA is trusted and the name is not checked, so the certificate can be self-signed. For the
+certificate in `cert.pem`:
+
+```shell
+$ openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der \
+    | openssl dgst -sha256 -binary | basenc --base64url | tr -d '='
+```
+
+Give values with `=` (`--pin=<pin>`, `--clock-offset=<seconds>`): a pin starts with `-` for about one key in 64, and
+the clock offset is negative when the node's clock is behind; as the next word, such a value is taken for options.
+
+`--insecure` takes any certificate instead (for tests: the tunnel is then open to whoever answers). `--alpn` and
+`--sni` set what the TLS ClientHello carries (defaults: `picoquic_sample`, `test.example.com`); the client listens on
+`--tcp-listen-host` (default `127.0.0.1`). The TLS keys are not logged.
+
+`--dnsauth` puts dnsauth-v2 (raycontrol's `docs/spec/dnsauth-v2.md`) in front of the packet in every query: the
+device's key for the service comes from the environment, `SLIPSTREAM_DNSAUTH_KEY` (64 hex digits; not an argument,
+which other processes may read), and `--clock-offset` moves the clock its epoch is counted on (the node's time less
+this one, in seconds). The node's front checks the field and passes the packet on without it.
+
+`--idle-timeout` (seconds, default 120, as the server's) ends the connection, and the client, when the server goes
+silent; the handshake gives up after 30 s.
+
+`--quiet` keeps stdout empty (it has a line per stream event); errors still go to stderr.
+
+The client exits with 1 on bad arguments, 2 when the handshake fails (the server does not answer, or refuses), and
+3 when the server's key is not the pinned one.
 
 
 ### Configuration of DNS records
@@ -59,7 +89,8 @@ This is a similar trick to using WireGuard on port 53, additionally encoding as 
 $ slipstream-client \
   --congestion-control=bbr \ # Faster better than dcubic in direct connections
   --resolver-address=x.x.x.x:yy \ # Address of slipstream server
-  --domain=test.com
+  --domain=test.com \
+  --pin=<base64url SHA-256 of the server's public key>
 ```
 
 ## Example data transfer
@@ -79,7 +110,8 @@ $ slipstream-client \
   --congestion-control=bbr \
   --tcp-listen-port=7000 \
   --resolver=127.0.0.1:8853 \
-  --domain=test.com
+  --domain=test.com \
+  --insecure
 Adding 127.0.0.1:8853
 Starting connection to 127.0.0.1
 Initial connection ID: 54545454
