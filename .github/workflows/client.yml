@@ -49,12 +49,11 @@ jobs:
         run: python3 .github/scripts/client_pin_test.py meson-build-release
 
   server-interop:
-    name: Against the released server
+    # This line's picoquic speaks multipath draft-20, which server-v0.2.0 and older do not: until the server's
+    # release on arngory/picoquic's slipstream line, the client goes against this tree's server (server/picoquic-port,
+    # merged here). Then back to the release: SERVER_RELEASE and its SHA-256, and the curl step below.
+    name: Against this tree's server
     runs-on: ubuntu-latest
-    env:
-      # the server as raycontrol ships it: the static release of the server's session (server-v0.2.0, dc5f41d)
-      SERVER_RELEASE: https://github.com/arngory/slipstream/releases/download/server-v0.2.0
-      SERVER_SHA256_AMD64: 59a0c3eb2a8bbbd8bdbd54c9ae8330d6e5e0dd328acab0e27d2f6f574d377b3f
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -66,16 +65,13 @@ jobs:
           sudo apt install -y cmake git pkg-config libssl-dev ninja-build gcc g++ python3-pip
           pip3 install meson
 
-      - name: Build this client; the released server
+      - name: Build this client and this tree's server
         run: |
-          meson setup --buildtype=release --warnlevel=0 build-client > /dev/null && ninja -C build-client slipstream-client
-          mkdir -p server-bin
-          curl -fsSL --retry 3 -o server-bin/slipstream-server "$SERVER_RELEASE/slipstream-server-linux-amd64"
-          echo "$SERVER_SHA256_AMD64  server-bin/slipstream-server" | sha256sum -c -
-          chmod +x server-bin/slipstream-server
+          meson setup --buildtype=release --warnlevel=0 build-client > /dev/null
+          ninja -C build-client slipstream-client slipstream-server
 
       - name: The client against the server
-        run: python3 .github/scripts/server_interop.py build-client server-bin
+        run: python3 .github/scripts/server_interop.py build-client build-client
 
   android:
     name: Android (${{ matrix.abi }})

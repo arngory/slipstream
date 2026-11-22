@@ -65,6 +65,7 @@ picoquic_opts.add_cmake_defines(
     {'CMAKE_POLICY_VERSION_MINIMUM': '3.5'},
     {'BUILD_DEMO': 'OFF'},
     {'BUILD_TESTING': 'OFF'},
+    {'PICOQUIC_ENFORCED_INITIAL_MTU': get_option('enforced_initial_mtu').to_string()},
   ],
 )
 # Configure picoquic debug printing
@@ -88,6 +89,11 @@ else
   picoquic_opts.add_cmake_defines(
     {'BUILD_LOGREADER': 'OFF'},
   )
+endif
+
+# OpenSSL linked in (a static server for any Linux: .github/scripts/server-static.sh)
+if get_option('static_openssl')
+  picoquic_opts.add_cmake_defines({'OPENSSL_USE_STATIC_LIBS': 'TRUE'})
 endif
 
 # Reference picoquic as a CMake subproject

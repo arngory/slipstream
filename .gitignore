@@ -16,4 +16,5 @@ unbound.conf
 unbound2.conf
 
 .cache
+build-static/
 __pycache__/

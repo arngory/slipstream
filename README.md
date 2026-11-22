@@ -1,4 +1,9 @@
 # Slipstream
+
+> **This is a fork.** arngory/slipstream carries the server of a [raycontrol](https://github.com/arngory/raycontrol)
+> node (branch `server/hardening`) and the client of [Niko](https://github.com/arngory/niko) (branch
+> `client/pin-alpn-sni`): what differs and who pins them is in [FORK.md](FORK.md). The rest of this file is upstream's.
+
 ![GitHub Release](https://img.shields.io/github/v/release/EndPositive/slipstream?include_prereleases&sort=semver&display_name=tag)
 ![GitHub License](https://img.shields.io/github/license/EndPositive/slipstream)
 

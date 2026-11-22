@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """This branch's client against the hardened server (its release, as raycontrol ships it): the dnsauth-v2 field the server takes off
 (--tag-len 8, the node's front has checked it), the server's ALPN required, streams whole both ways, a half-close's
-answer; another ALPN fails the handshake (exit 2), a client without the field gets nothing through. A zone of 29
-characters still carries streams (the packet size the encoder fits under it), one of 30 is refused at the start
-(exit 1).
+answer; another ALPN fails the handshake (exit 2), a client without the field gets nothing through. A zone of 134
+characters still carries streams (the packet size the encoder fits under it, 64 bytes, the server's least), one of
+135 is refused at the start (exit 1).
 Usage: server_interop.py <the client's build directory> <the directory of the server binary>."""
 import base64
 import hashlib
@@ -20,8 +20,8 @@ SERVER = os.path.join(sys.argv[2], "slipstream-server")
 DOMAIN, ALPN = "tunnel.test", "k3x9q2p7m1"
 DNS_PORT, TARGET_PORT = 8953, 5301
 LONG_DNS_PORT = 8954
-LONG_ZONE = "t" * 20 + ".test.net"  # 29 characters
-TOO_LONG_ZONE = "t" * 21 + ".test.net"  # 30
+LONG_ZONE = "t" * 62 + "." + "t" * 62 + ".test.net"  # 134 characters
+TOO_LONG_ZONE = "t" * 63 + "." + "t" * 62 + ".test.net"  # 135
 KEY = "0b485b425e8b19e0ec7c0362d55fdc34338147f984b87ee005455c8f5fc68b1c"
 WORK = tempfile.mkdtemp()
 procs, failures = [], []
@@ -145,17 +145,17 @@ try:
 
     client("long zone", 7104, "--pin=" + pin, "--alpn=" + ALPN, "--dnsauth", env=tagged, domain=LONG_ZONE,
            dns_port=LONG_DNS_PORT)
-    check("a zone of 29 characters", ask(7104, time.monotonic() + 60), b"answer to hello\n")
-    check("a zone of 29 characters, a download", exchange(7104, b"download %d\n" % (64 * 1024), False, 120),
+    check("a zone of 134 characters", ask(7104, time.monotonic() + 60), b"answer to hello\n")
+    check("a zone of 134 characters, a download", exchange(7104, b"download %d\n" % (64 * 1024), False, 120),
           pattern(64 * 1024))
     too_long = client("too long a zone", 7105, "--pin=" + pin, "--alpn=" + ALPN, "--dnsauth", env=tagged,
                       domain=TOO_LONG_ZONE, dns_port=LONG_DNS_PORT)
     try:
         too_long.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        failures.append("a zone of 30 characters: the client still runs")
+        failures.append("a zone of 135 characters: the client still runs")
     if too_long.returncode != 1:
-        failures.append("a zone of 30 characters: exit %s, want 1 (refused at the start)" % too_long.returncode)
+        failures.append("a zone of 135 characters: exit %s, want 1 (refused at the start)" % too_long.returncode)
 finally:
     for name, proc in procs:
         proc.terminate()

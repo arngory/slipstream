@@ -16,6 +16,9 @@ extern "C" {
 
 #define SLIPSTREAM_QLOG_DIR "./qlog";
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/socket.h>
 
 typedef struct st_address_t {
     struct sockaddr_storage server_address;
@@ -47,9 +50,31 @@ int picoquic_slipstream_client(const char* listen_host, int listen_port, struct 
                                size_t keep_alive_interval, const slipstream_client_tls_t* tls,
                                const slipstream_client_dnsauth_t* dnsauth, uint64_t idle_timeout_ms);
 
-int picoquic_slipstream_server(int server_port, bool listen_ipv6, const struct sockaddr_storage* listen_address,
-                               const char* pem_cert, const char* pem_key,
-                               struct sockaddr_storage* target_address, const char* domain_name);
+/* The server's settings (slipstream_server_cli.cpp fills them in). */
+typedef struct st_slipstream_server_config_t {
+    /* DNS over UDP on this port, or queries from a DNS front over a unix
+     * SOCK_SEQPACKET socket (front_socket; docs/server-front.md). */
+    int listen_port;
+    bool listen_ipv6;
+    const struct sockaddr_storage* listen_address; /* NULL: the wildcard */
+    const char* front_socket;  /* NULL: UDP */
+    long front_uid;            /* the front's UID; -1: any */
+    const char* cert;
+    const char* key;
+    struct sockaddr_storage target; /* TCP host:port, or AF_UNIX */
+    const char* domain;
+    const char* alpn;
+    uint64_t idle_timeout_ms;  /* a connection that sends nothing goes */
+    uint32_t max_connections;
+    uint32_t max_streams;      /* bidirectional streams per connection */
+    size_t max_pending;        /* bytes queued towards the target, all streams */
+    size_t tag_len;            /* bytes the front checked before the QUIC packet */
+    /* A device's connections at once, by the device the front names (IPC
+     * version 2); 0: no limit. */
+    uint32_t max_device_connections;
+} slipstream_server_config_t;
+
+int picoquic_slipstream_server(const slipstream_server_config_t* config);
 
 #ifdef __cplusplus
 }

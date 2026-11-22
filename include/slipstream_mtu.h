@@ -8,8 +8,9 @@ extern "C" {
 #endif
 
 /* The least QUIC packet the server takes: its picoquic drops an Initial shorter than this
- * (PICOQUIC_ENFORCED_INITIAL_MTU) and takes no max_packet_size below it. */
-#define SLIPSTREAM_MIN_MTU 129
+ * (PICOQUIC_ENFORCED_INITIAL_MTU of arngory/picoquic's slipstream line, 64; the old fork's was 129) and takes no
+ * max_packet_size below it. The client's own picoquic has the same floor: slipstream_client.c checks the two match. */
+#define SLIPSTREAM_MIN_MTU 64
 
 /* The largest QUIC packet whose query name fits, as client_encode_segment builds it: extra bytes in front of the
  * packet (the dnsauth-v2 field), base32 of both, a dot every 57 characters, a dot, the zone, the root and the end;
