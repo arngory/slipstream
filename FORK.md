@@ -12,6 +12,12 @@ side; `main` stays upstream's.
 | **`server/hardening`** | raycontrol (the server) | the server hardened for queries from anyone, behind niko-server's DNS front (it names the device); copies of packets and abandoned paths kept in bounds; a limit of connections per device (`--max-connections-per-device`); a static build (Alpine, musl, OpenSSL linked in) for amd64 and arm64; releases `server-vX.Y.Z` with `SHA256SUMS` |
 | `client/pin-alpn-sni` | Niko (the client) | the client Niko embeds: the server's key by its pin, ALPN and SNI from the arguments, no key log; streams ended by their FIN; dnsauth-v2 in every query; idle and handshake timeouts; the Android build (4 ABIs, OpenSSL static); CI against the released server |
 
+Both build picoquic from [arngory/picoquic](https://github.com/arngory/picoquic), branch `slipstream` (upstream
+picoquic and the slipstream series; what each patch changes and why is in its `FORK.md`), not from
+EndPositive/slipstream-picoquic: the server from this line on, the client once it moves. The enforced initial MTU is a
+build option (`enforced_initial_mtu`, 64 by default) and must match picoquic's, or the link fails. Multipath moved to
+draft-20 there: a new client does not work with an older server, so the server is released first.
+
 Each side's branch is its own: a change to the server goes to `server/hardening`, a change to the client to
 `client/pin-alpn-sni`.
 

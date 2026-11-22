@@ -13,7 +13,7 @@ typedef struct st_slipstream_server_cc_t {
 } slipstream_server_cc_t;
 
 
-static void slipstream_server_cc_init(picoquic_cnx_t * cnx, picoquic_path_t* path_x, uint64_t current_time)
+static void slipstream_server_cc_init(picoquic_path_t* path_x, char const* option_string, uint64_t current_time)
 {
     slipstream_server_cc_t* state = (slipstream_server_cc_t*)malloc(sizeof(slipstream_server_cc_t));
     path_x->congestion_alg_state = (void*)state;
@@ -48,11 +48,12 @@ static void slipstream_server_cc_observe(picoquic_path_t* path_x, uint64_t* cc_s
 #define PICOQUIC_CC_ALGO_NUMBER_SLIPSTREAM_SERVER 10
 
 picoquic_congestion_algorithm_t slipstream_server_cc_algorithm_struct = {
-    picoquic_slipstream_server_cc_ID, PICOQUIC_CC_ALGO_NUMBER_SLIPSTREAM_SERVER,
-    slipstream_server_cc_init,
-    slipstream_server_cc_notify,
-    slipstream_server_cc_delete,
-    slipstream_server_cc_observe
+    .congestion_algorithm_id = picoquic_slipstream_server_cc_ID,
+    .congestion_algorithm_number = PICOQUIC_CC_ALGO_NUMBER_SLIPSTREAM_SERVER,
+    .alg_init = slipstream_server_cc_init,
+    .alg_notify = slipstream_server_cc_notify,
+    .alg_delete = slipstream_server_cc_delete,
+    .alg_observe = slipstream_server_cc_observe
 };
 
 picoquic_congestion_algorithm_t* slipstream_server_cc_algorithm = &slipstream_server_cc_algorithm_struct;

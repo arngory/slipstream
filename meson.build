@@ -65,6 +65,7 @@ picoquic_opts.add_cmake_defines(
     {'CMAKE_POLICY_VERSION_MINIMUM': '3.5'},
     {'BUILD_DEMO': 'OFF'},
     {'BUILD_TESTING': 'OFF'},
+    {'PICOQUIC_ENFORCED_INITIAL_MTU': get_option('enforced_initial_mtu').to_string()},
   ],
 )
 # Configure picoquic debug printing

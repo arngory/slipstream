@@ -102,7 +102,9 @@ sys.exit(0 if s.recv(1000) else 1)" 2>/dev/null; then
   fail "a second connection of the device got through"
 fi
 grep -q 'new connection refused' device.log || fail "no refusal logged: $(tail -3 device.log)"
-kill "$a1" "$a2"; wait "$a1" "$a2" 2>/dev/null || true
+# kill -9: on SIGTERM the client closes its connection, and then there is
+# nothing left to evict
+kill -9 "$a1" "$a2"; wait "$a1" "$a2" 2>/dev/null || true
 "$build/slipstream-client" -l 25423 -r 127.0.0.1:25320 -d pppppppppppppppp.t.example >device-a3.log 2>&1 & pids+=($!)
 echo_through 25423 || fail "the device's client restarted at once"
 grep -q 'gives way to its new one' device.log || fail "no eviction logged: $(tail -3 device.log)"

@@ -1,6 +1,7 @@
 [submodule "subprojects/picoquic"]
 	path = subprojects/picoquic
-	url = https://github.com/EndPositive/slipstream-picoquic
+	url = https://github.com/arngory/picoquic
+	branch = slipstream
 [submodule "extern/SPCDNS"]
 	path = extern/SPCDNS
 	url = https://github.com/spc476/SPCDNS.git

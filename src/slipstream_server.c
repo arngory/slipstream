@@ -64,6 +64,11 @@ static size_t server_tag_len = 0;
 #define FRONT_DEVICE_LEN 8
 /* The front forwards queries up to this size; SPCDNS decodes into 4 KiB. */
 #define SERVER_MAX_QUERY 4096
+/* Each connection's receive window and that of each of its streams, in
+ * bytes; see the flow control in picoquic_slipstream_server. */
+#ifndef SLIPSTREAM_SERVER_WINDOW
+#define SLIPSTREAM_SERVER_WINDOW (256 * 1024)
+#endif
 
 typedef struct st_server_slot_t {
     slot_t s; /* first: server_decode and server_encode take it as slot_t */
@@ -1394,7 +1399,8 @@ static void seen_take(uint64_t h, uint64_t now) {
  * challenge: prepare demotes it and clears its connection ID before using
  * it, review), with the peer's connection ID. */
 static bool server_path_usable(const picoquic_path_t* path) {
-    return path != NULL && !path->path_is_demoted && !path->challenge_failed && path->p_remote_cnxid != NULL;
+    return path != NULL && !path->path_is_demoted && path->first_tuple != NULL &&
+        !path->first_tuple->challenge_failed && path->first_tuple->p_remote_cnxid != NULL;
 }
 
 /* Whether a connection has a path a packet can go on. */
@@ -1511,7 +1517,7 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
                 free(decoded);
                 continue; /* a copy: answered empty */
             }
-            int ret = picoquic_incoming_packet_ex(quic, decoded, (size_t)decoded_len,
+            int ret = picoquic_incoming_packet_path_ex(quic, decoded, (size_t)decoded_len,
                 (struct sockaddr*)&peer_addr, (struct sockaddr*)&local_addr, 0, 0,
                 &last_cnx, &last_path_id, receive_time);
             free(decoded);
@@ -1621,7 +1627,7 @@ static int server_loop(picoquic_quic_t* quic, slipstream_server_ctx_t* default_c
                 slot->s.path_id = server_first_path(slot->s.cnx);
             }
             if (slot->s.error == RCODE_OKAY && slot->s.cnx != NULL &&
-                picoquic_prepare_packet_ex(slot->s.cnx, slot->s.path_id, loop_time,
+                picoquic_prepare_packet_path_ex(slot->s.cnx, slot->s.path_id, loop_time,
                     send_buffer, sizeof(send_buffer), &send_length,
                     &peer_addr, &local_addr, &if_index, NULL) != 0) {
                 send_length = 0;
@@ -1722,10 +1728,19 @@ int picoquic_slipstream_server(const slipstream_server_config_t* cfg) {
     /* 0 left connections without a limit: a client that went away kept
      * its place until a restart. */
     config.idle_timeout = (int)cfg->idle_timeout_ms;
+    /* The receive window, fixed (picoquic_set_max_data_control): picoquic
+     * keeps out-of-order stream data up to PICOQUIC_REORDER_MEMORY_FACTOR
+     * (64) times the free window in 1600-byte nodes, so this bounds what one
+     * connection can pin with tiny out-of-order frames (review B3). Without
+     * the limit picoquic grows the window as data arrives: 4 MB sent in
+     * order took the default 1 MiB window to 7.9 MB, a bound of 524 MB. */
+    config.flow_control_max = SLIPSTREAM_SERVER_WINDOW;
 
     /* Create the QUIC context for the server */
     current_time = picoquic_current_time();
     /* Create QUIC context */
+    /* picoquic resolves CC names only among registered algorithms */
+    picoquic_register_all_congestion_control_algorithms();
     picoquic_quic_t* quic = picoquic_create_and_configure(&config, slipstream_server_callback, &default_context, current_time, NULL);
     if (quic == NULL) {
         fprintf(stderr, "Could not create server context\n");
@@ -1751,11 +1766,15 @@ int picoquic_slipstream_server(const slipstream_server_config_t* cfg) {
 #endif
     picoquic_set_default_congestion_algorithm(quic, slipstream_server_cc_algorithm);
     picoquic_tp_t tp = *picoquic_get_default_tp(quic);
-    tp.initial_max_stream_id_bidir = cfg->max_streams;
+    tp.initial_max_data = SLIPSTREAM_SERVER_WINDOW;
+    tp.initial_max_stream_data_bidi_local = SLIPSTREAM_SERVER_WINDOW;
+    tp.initial_max_stream_data_bidi_remote = SLIPSTREAM_SERVER_WINDOW;
+    tp.initial_max_stream_data_uni = SLIPSTREAM_SERVER_WINDOW;
+    tp.initial_max_streams_bidi = cfg->max_streams;
     /* 0 means no limit to picoquic: one frame on a far stream ID made it
      * allocate every stream below it (review). The client opens none; the
      * callback refuses one anyway. */
-    tp.initial_max_stream_id_unidir = 1;
+    tp.initial_max_streams_uni = 1;
     picoquic_set_default_tp(quic, &tp);
 
     server_io_t io = {.udp_fd = -1, .listen_fd = -1, .front_fd = -1, .front_uid = cfg->front_uid};

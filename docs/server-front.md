@@ -95,6 +95,12 @@ takes as a protocol violation) gets the close in its answer: the connection goes
 - Streams: the client's bidirectional ones only (`--max-streams`). The client opens no other: a unidirectional
   stream closes the connection (refused one by one, their records stayed until it ended). The transport
   parameters allow one (picoquic reads 0 as no limit).
+- Receive window: 256 KiB for the connection and for each stream, fixed (`flow_control_max`; picoquic otherwise
+  raises it as data arrives). picoquic keeps out-of-order stream data up to 64 times the free window in 1600-byte
+  nodes, so a client sending tiny frames out of order pins at most 10,923 nodes, 17.5 MB, per connection (1.1 GB at
+  `-m 64`); with picoquic's default window, which grows, it was 70 MB and up. On loopback the window caps one
+  connection's upload near 1 MB/s; through a path of 100 ms or more the tunnel's own rate (about 100 KB/s at 100 ms)
+  is the limit.
 - The UDP socket does not block: a lone query is answered at once, and SIGTERM ends the loop.
 - Paths (multipath): a path that went away since its query is looked up again by its unique ID before the answer;
   one abandoned since, about to be (a failed challenge), or still without the peer's connection ID, is not used: the
