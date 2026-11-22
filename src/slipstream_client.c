@@ -23,6 +23,7 @@
 #include "picoquic_config.h"
 #include "slipstream.h"
 #include "slipstream_dnsauth.h"
+#include "slipstream_mtu.h"
 #include "slipstream_inline_dots.h"
 #include "slipstream_pin.h"
 #include "slipstream_utils.h"
@@ -93,9 +94,8 @@ ssize_t client_encode_segment(dns_packet_t* packet, size_t* packet_len, const un
         src_buf = tagged;
         src_buf_len += SLIPSTREAM_DNSAUTH_LEN;
     }
-    /* base32 grows 8/5, a dot every 57: the name and the zone must fit in a DNS name */
-    const size_t b32_len = (src_buf_len * 8 + 4) / 5;
-    if (b32_len + (b32_len > 0 ? (b32_len - 1) / 57 : 0) + 1 + client_domain_name_len + 2 > sizeof(name)) {
+    /* base32 grows 8/5, a dot every 57: the name and the zone must fit in a DNS name (the field is in src_buf now) */
+    if (!slipstream_client_name_fits(src_buf_len, 0, client_domain_name_len)) {
         DBG_PRINTF("a packet of %zu bytes does not fit in a name under the zone\n", src_buf_len);
         return -1;
     }
@@ -845,14 +845,18 @@ int picoquic_slipstream_client(const char* listen_host, int listen_port, struct 
     client_domain_name = strdup(domain_name);
     client_domain_name_len = strlen(domain_name);
 
-    double mtu_d = 240 - (double) client_domain_name_len;
-    mtu_d = mtu_d / 1.6;
-    int mtu = (int) mtu_d;
+    /* the largest packet whose name fits under the zone, the dnsauth-v2 field in front of it: a zone of 29
+     * characters still leaves the server's least (the estimate (240 - L) / 1.6 stopped at 20) */
+    const size_t mtu_fit = slipstream_client_mtu(client_domain_name_len, dnsauth != NULL ? SLIPSTREAM_DNSAUTH_LEN : 0);
+    if (mtu_fit < SLIPSTREAM_MIN_MTU) {
+        fprintf(stderr, "The zone of %zu characters leaves packets of %zu bytes; the server takes %d at least\n",
+                client_domain_name_len, mtu_fit, SLIPSTREAM_MIN_MTU);
+        return 1;
+    }
+    int mtu = (int) mtu_fit;
     if (dnsauth != NULL) {
-        /* the field takes 8 of the bytes a name holds */
         client_dnsauth_conf = *dnsauth;
         client_dnsauth = true;
-        mtu -= SLIPSTREAM_DNSAUTH_LEN;
     }
 
     /* Create config */

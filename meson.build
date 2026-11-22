@@ -118,6 +118,7 @@ client_sources = files(
   src / 'slipstream_client_cli.cpp',
   src / 'slipstream_pin.c',
   src / 'slipstream_dnsauth.c',
+  src / 'slipstream_mtu.c',
 )
 
 # Sources only used by server
@@ -147,6 +148,15 @@ dnsauth_test = executable(
   build_by_default: false,
 )
 test('dnsauth-v2 vectors', dnsauth_test)
+
+# the packet size a zone leaves (meson test)
+mtu_test = executable(
+  'slipstream-mtu-test',
+  files(src / 'slipstream_mtu_test.c', src / 'slipstream_mtu.c'),
+  include_directories: include_dirs,
+  build_by_default: false,
+)
+test('packet size under a zone', mtu_test)
 
 # The final server executable
 executable(

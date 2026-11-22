@@ -34,7 +34,7 @@ jobs:
       - name: The pin and dnsauth code without warnings
         working-directory: meson-build-release
         run: |
-          for file in slipstream_pin.c slipstream_dnsauth.c; do
+          for file in slipstream_pin.c slipstream_dnsauth.c slipstream_mtu.c; do
             command=$(jq -r --arg f "$file" '[.[] | select(.file | endswith($f))][0].command' compile_commands.json)
             test -n "$command" && test "$command" != null
             # only this file's own lines: the headers of picoquic and picotls are not ours

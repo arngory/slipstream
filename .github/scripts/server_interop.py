@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """This branch's client against the hardened server (its release, as raycontrol ships it): the dnsauth-v2 field the server takes off
 (--tag-len 8, the node's front has checked it), the server's ALPN required, streams whole both ways, a half-close's
-answer; another ALPN fails the handshake (exit 2), a client without the field gets nothing through.
+answer; another ALPN fails the handshake (exit 2), a client without the field gets nothing through. A zone of 29
+characters still carries streams (the packet size the encoder fits under it), one of 30 is refused at the start
+(exit 1).
 Usage: server_interop.py <the client's build directory> <the directory of the server binary>."""
 import base64
 import hashlib
@@ -17,6 +19,9 @@ CLIENT = os.path.join(sys.argv[1], "slipstream-client")
 SERVER = os.path.join(sys.argv[2], "slipstream-server")
 DOMAIN, ALPN = "tunnel.test", "k3x9q2p7m1"
 DNS_PORT, TARGET_PORT = 8953, 5301
+LONG_DNS_PORT = 8954
+LONG_ZONE = "t" * 20 + ".test.net"  # 29 characters
+TOO_LONG_ZONE = "t" * 21 + ".test.net"  # 30
 KEY = "0b485b425e8b19e0ec7c0362d55fdc34338147f984b87ee005455c8f5fc68b1c"
 WORK = tempfile.mkdtemp()
 procs, failures = [], []
@@ -100,9 +105,9 @@ def check(name, got, want):
         failures.append("%s: %r, want %r" % (name, shown, want if len(want) <= 80 else b"%d bytes" % len(want)))
 
 
-def client(name, port, *extra, env=None):
-    return start(name, [CLIENT, "--tcp-listen-port=%d" % port, "--resolver=127.0.0.1:%d" % DNS_PORT,
-                        "--domain=" + DOMAIN, "--quiet", *extra], env)
+def client(name, port, *extra, env=None, domain=DOMAIN, dns_port=DNS_PORT):
+    return start(name, [CLIENT, "--tcp-listen-port=%d" % port, "--resolver=127.0.0.1:%d" % dns_port,
+                        "--domain=" + domain, "--quiet", *extra], env)
 
 
 try:
@@ -110,6 +115,8 @@ try:
     threading.Thread(target=target, daemon=True).start()
     start("server", [SERVER, "-l", str(DNS_PORT), "-b", "127.0.0.1", "-a", "127.0.0.1:%d" % TARGET_PORT, "-c", crt,
                      "-k", key, "-d", DOMAIN, "-n", ALPN, "-t", "8"])
+    start("long zone server", [SERVER, "-l", str(LONG_DNS_PORT), "-b", "127.0.0.1", "-a", "127.0.0.1:%d" % TARGET_PORT,
+                               "-c", crt, "-k", key, "-d", LONG_ZONE, "-n", ALPN, "-t", "8"])
     time.sleep(1)
     tagged = {"SLIPSTREAM_DNSAUTH_KEY": KEY}
     client("tagged", 7101, "--pin=" + pin, "--alpn=" + ALPN, "--sni=cdn.example.net", "--dnsauth", env=tagged)
@@ -135,6 +142,20 @@ try:
     if other_alpn.returncode != 2:
         failures.append("another ALPN: exit %s, want 2 (the handshake failed)" % other_alpn.returncode)
     check("no field", ask(7103, time.monotonic() + 20), b"")
+
+    client("long zone", 7104, "--pin=" + pin, "--alpn=" + ALPN, "--dnsauth", env=tagged, domain=LONG_ZONE,
+           dns_port=LONG_DNS_PORT)
+    check("a zone of 29 characters", ask(7104, time.monotonic() + 60), b"answer to hello\n")
+    check("a zone of 29 characters, a download", exchange(7104, b"download %d\n" % (64 * 1024), False, 120),
+          pattern(64 * 1024))
+    too_long = client("too long a zone", 7105, "--pin=" + pin, "--alpn=" + ALPN, "--dnsauth", env=tagged,
+                      domain=TOO_LONG_ZONE, dns_port=LONG_DNS_PORT)
+    try:
+        too_long.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        failures.append("a zone of 30 characters: the client still runs")
+    if too_long.returncode != 1:
+        failures.append("a zone of 30 characters: exit %s, want 1 (refused at the start)" % too_long.returncode)
 finally:
     for name, proc in procs:
         proc.terminate()
