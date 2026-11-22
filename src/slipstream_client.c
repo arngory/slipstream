@@ -298,7 +298,7 @@ void slipstream_add_paths(slipstream_client_ctx_t* client_ctx) {
 
         print_sockaddr_ip_and_port(&slipstream_path->server_address);
         int path_id = -2;
-        picoquic_probe_new_path_ex(cnx, (struct sockaddr*)&slipstream_path->server_address, (struct sockaddr*)&cnx->path[0]->local_addr, 0, current_time, 0, &path_id);
+        picoquic_probe_new_path_id_ex(cnx, (struct sockaddr*)&slipstream_path->server_address, (struct sockaddr*)&cnx->path[0]->first_tuple->local_addr, 0, current_time, 0, &path_id);
         if (path_id < 0) {
             DBG_PRINTF("Failed adding path", NULL);
             continue;
@@ -734,6 +734,8 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     // one connection only, freed in slipstream_client_free_context on picoquic close callback
     slipstream_client_ctx_t client_ctx = {0};
     /* Create QUIC context */
+    /* picoquic resolves CC names only among registered algorithms */
+    picoquic_register_all_congestion_control_algorithms();
     picoquic_quic_t* quic = picoquic_create_and_configure(&config, slipstream_client_callback, &client_ctx, current_time, NULL);
     if (quic == NULL) {
         fprintf(stderr, "Could not create server context\n");

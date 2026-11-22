@@ -6,3 +6,6 @@ option('static_openssl', type : 'boolean', value: false)
 
 # Link OpenSSL statically (picoquic's FindOpenSSL)
 option('static_openssl', type : 'boolean', value: false)
+
+# Smallest initial QUIC packet picoquic takes or sends (picoquic_internal.h PICOQUIC_ENFORCED_INITIAL_MTU)
+option('enforced_initial_mtu', type : 'integer', min : 64, max : 1200, value : 64)
